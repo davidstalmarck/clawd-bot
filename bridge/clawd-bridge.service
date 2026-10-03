@@ -1,0 +1,13 @@
+[Unit]
+Description=Clawd bot bridge (Claude Code hooks + voice -> atech board)
+
+[Service]
+WorkingDirectory=%h/clawd-bot
+EnvironmentFile=-%h/.config/clawd_bot/env
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=%h/clawd-bot/.venv/bin/python -u bridge/clawd_bridge.py run --workdir %h/clawd-bot
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

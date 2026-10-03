@@ -1,0 +1,74 @@
+id: microphone
+name: "I2S MEMS Microphone (ICS-43434)"
+category: audio
+interface: gpio
+size: 2
+description: |
+  I2S MEMS microphone (ICS-43434) for sound-level detection and audio capture.
+  24-bit samples at 16 kHz. Spans TWO adjacent ports — placement requires an
+  adjacent pair like [1, 2] / [3, 4]. A background FreeRTOS task reads the I2S
+  bus (on I2S_NUM_1, so it won't clash with the speaker on I2S_NUM_0) and caches
+  the RMS/peak level, so the getters return instantly. Line A1 = LR select,
+  Line B1 = WS, Line A2 = SCK, Line B2 = SD.
+
+driver:
+  header: microphone.h
+  source: microphone.cpp
+  class_name: Microphone
+
+templates:
+  # Constructor is (lrPin, wsPin, sckPin, sdPin):
+  # LR = primary Line A (pin_a), WS = primary Line B (pin_b),
+  # SCK = secondary Line A (pin_a2), SD = secondary Line B (pin_b2).
+  globals: |
+    Microphone {{ instance }}({{ pin_a }}, {{ pin_b }}, {{ pin_a2 }}, {{ pin_b2 }});
+  setup: |
+    {{ instance }}.begin();
+  # Built-in: emit the current RMS sound level every 250 ms as a JSON event.
+  loop: |
+    static unsigned long {{ instance }}_last = 0;
+    if (millis() - {{ instance }}_last >= 250) {
+      {{ instance }}_last = millis();
+      Serial.print("{\"type\":\"event\",\"payload\":{\"event_type\":\"sensor\",\"key\":\"{{ instance }}_level\",\"value\":");
+      Serial.print({{ instance }}.getSoundLevel());
+      Serial.println(",\"source\":\"microphone\"}}");
+    }
+
+events:
+  - key: level
+    type: sensor
+    value_type: int
+    description: "Current RMS sound level, 0-32767. Emitted every 250 ms."
+
+actions: []
+lib_deps: []
+
+usage: |
+  // Public API of Microphone — the instance is `{{ instance }}`.
+  // begin() ran in setup() and started a background capture task, so the level
+  // getters below return the latest cached value instantly (never block). If you
+  // leave loop empty, the module already streams a `level` event every 250 ms.
+
+  // --- sound level / detection ---
+  int16_t level = {{ instance }}.getSoundLevel();          // RMS, 0..32767
+  if ({{ instance }}.isSoundDetected(500)) { /* above threshold */ }
+  int16_t peak = {{ instance }}.getPeakAmplitude();        // peak since last read (resets)
+
+  // --- raw samples (max BUFFER_SAMPLES = 512 per call) ---
+  int16_t buf[512];
+  int n = {{ instance }}.getSamples(buf, 512);
+
+  // --- continuous stream (no length cap): every sample delivered once ---
+  {{ instance }}.startStream();                             // e.g. on push-to-talk
+  int16_t chunk[256];
+  int got = {{ instance }}.readStream(chunk, 256);          // drain every loop
+  {{ instance }}.stopStream();
+  uint32_t lost = {{ instance }}.streamOverruns();          // >0 = drained too slowly
+  
+  // --- record to a heap buffer (up to ~3 s at 16 kHz), then play back ---
+  {{ instance }}.startRecording();
+  // ... let time pass in your loop (non-blocking) ...
+  {{ instance }}.stopRecording();
+  const int16_t* rec = {{ instance }}.getRecording();      // MUST be const
+  int len = {{ instance }}.getRecordingLength();           // sample count
+  // Pair with a speaker on another port for playback: spk.writeSamples(rec, len);

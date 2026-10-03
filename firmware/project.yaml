@@ -1,0 +1,510 @@
+name: clawd_bot
+board: 14port
+modules_path: ./modules   # patched microphone + st7735_tft drivers; override the SDK's copies
+
+# Clawd bot: shows what Claude Code is doing, and is a push-to-talk
+# voice front-end for a Claude Code session. Driven by bridge/clawd_bridge.py.
+#
+# All 12 slots are used: 5 double-width modules + 2 singles.
+#   eyes  [1,2] [5,6]  HARDWARE-CONFIRMED pairs (see projects/clawd_eyes)
+#   mic   [3,4]        primary port_4 (left column -> higher port)  UNVERIFIED
+#   knob  [9,10]       primary port_9 (right column -> lower port)  UNVERIFIED
+#   spk   [13,14]      primary port_13                              UNVERIFIED
+#   btn   7            isolated middle slot
+#   led   11           GPIO 43/44 (UART0 TX/RX): may flicker during ROM boot log
+#
+# Wire protocol (one JSON object per line):
+#   host -> board  {"action":"orient_l","value":"1|3"}       live eye rotation test
+#                  {"action":"mood","value":"idle|thinking|tool|waiting|done|listening|speaking|error|sleep"}
+#                  {"action":"label","value":"Bash"}          left-eye caption
+#                  {"action":"detail","value":"npm test"}     right-eye caption
+#                  {"action":"spk_play_pcm","value":"<b64 16 kHz s16le mono>"}
+#                  {"action":"spk_stop","value":""}
+#   board -> host  btn 1/0 (template), knob_btn 1 (template), volume 0-100,
+#                  mic_audio <b64 chunk> while the button is held, ptt "end".
+#
+# NOTE: the button/knob module templates consume wasPressed()/wasRotated*()
+# edges BEFORE this code runs, so the loop below tracks isPressed() and
+# getPosition() levels itself.
+modules:
+  - {id: st7735_tft,     instance: eye_l, port: [1, 2]}
+  - {id: st7735_tft,     instance: eye_r, port: [5, 6]}
+  - {id: microphone,     instance: mic,   port: [3, 4]}
+  - {id: rotary_encoder, instance: knob,  port: [9, 10]}
+  - {id: speaker,        instance: spk,   port: [13, 14]}
+  - {id: button,         instance: btn,   port: 7}
+  - {id: neopixel,       instance: led,   port: 11}
+
+code:
+  setup: |
+    // Base64 audio both ways is ~45 kB/s; the default 256-byte CDC buffers
+    // would drop most of it. Resize in place (Serial.end() would force USB
+    // re-enumeration).
+    Serial.flush();
+    Serial.setRxBufferSize(8192);
+    Serial.setTxBufferSize(16384);
+    Serial.setTxTimeoutMs(20);
+
+    // The screens are mounted PORTRAIT. Draw on an 80x160 canvas; 1 vs 3 is
+    // which panel edge is up. The boot card below shows an arrow that must
+    // point UP on each eye - if one is upside down, flip its value here (or
+    // send {"action":"orient_l","value":"3"} to try it live).
+    const uint8_t EYE_L_ROT = 1, EYE_R_ROT = 1;
+    eye_l.setCanvasRotation(EYE_L_ROT);
+    eye_r.setCanvasRotation(EYE_R_ROT);
+    for (uint8_t e = 0; e < 2; e++) {
+      ST7735_TFT& s = e == 0 ? eye_l : eye_r;
+      s.fillScreen(ST7735_TFT::COLOR_BLACK);
+      for (int16_t i = 0; i < 22; i++) s.drawLine(40 - i, 24 + i, 40 + i, 24 + i, 0xDBAA);
+      s.fillRect(33, 46, 14, 44, 0xDBAA);
+      s.displayText("UP", 28, 100, 2, ST7735_TFT::COLOR_WHITE);
+      s.displayText(e == 0 ? "left" : "right", e == 0 ? 28 : 25, 124, 1, 0x8410);
+      s.display();
+    }
+    delay(1500);   // setup only: long enough to read the orientation card
+
+    spk.setVolume(0.4f);
+    knob.setRingColor(217, 119, 87);
+    knob.setRingBrightness(40);
+    knob.setRingPosition(0.4f * 12.0f);
+    led.clear();
+    led.show();
+
+    Serial.println("{\"type\":\"event\",\"payload\":{\"event_type\":\"state\",\"key\":\"boot\",\"value\":\"clawd_bot\"}}");
+
+  loop: |
+    // ======================= constants =======================
+    // PORTRAIT: logical canvas is 80 wide x 160 tall (see setCanvasRotation).
+    const int16_t  W = 80;
+    const int16_t  CX = 40, CY = 68;          // eye centre; y 0..135 is eye area
+    const int16_t  EYE_MAX_Y = 136;           // caption strip lives below this
+    const int16_t  CAP_Y = 137, CAP_H = 23;   // two 13-char lines
+    const uint16_t C_BLACK  = 0x0000;
+    const uint16_t C_ORANGE = 0xDBAA;         // #D97757 Claude orange
+    const uint16_t C_AMBER  = 0xFD80;         // #FFB000
+    const uint16_t C_BLUE   = 0x5E5F;         // #5AC8FA
+    const uint16_t C_RED    = 0xE249;         // #E5484D
+    const uint16_t C_DIM    = 0x69C5;         // #6B3A2B
+    const uint16_t C_GREY   = 0x8410;
+    const uint32_t SLEEP_AFTER_MS = 10UL * 60UL * 1000UL;
+
+    enum Mood { IDLE, THINKING, TOOL, WAITING, DONE, LISTENING, SPEAKING, ERR, SLEEP };
+    enum Style { PILL, HAPPY, FLAT };
+    struct Shape { int16_t dx, dy, w, h; uint16_t col; uint16_t style; };   // no padding: memcmp-safe
+
+    // ======================= state =======================
+    static bool     booted = false;
+    static Mood     mood = IDLE;
+    static uint32_t moodSince = 0, lastActivity = 0, lastFrame = 0, lastLed = 0;
+    static bool     needFull = true, capDirty = true;
+    static Shape    cur = {0, 0, 0, 0, 0, PILL};
+    static char     label[27] = "", detail[27] = "";
+    static float    t = 0.0f;
+    static int16_t  gazeX = 0, gazeY = 0, tgtX = 0, tgtY = 0;
+    static uint32_t nextGlance = 0, nextBlink = 0, blinkUntil = 0;
+    static float    vol = 0.4f;
+    static int32_t  lastKnob = 0;
+    static uint32_t volShownAt = 0;
+    static bool     volVisible = false;
+    static bool     talking = false, wasDown = false;
+    static uint32_t talkStart = 0;
+    static int16_t  pcmBuf[256];
+    static int      pcmN = 0;
+    static char     line[6144];
+    static int      lineN = 0;
+    static bool     lineOverflow = false;
+
+    uint32_t now = millis();
+    if (!booted) {
+      booted = true;
+      moodSince = lastActivity = now;
+      lastKnob = knob.getPosition();
+      nextGlance = now + 2000;
+      nextBlink = now + 3000;
+    }
+
+    // ======================= helpers =======================
+    auto rrect = [](ST7735_TFT& s, int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint16_t c) {
+      if (w <= 0 || h <= 0) return;
+      if (r * 2 > w) r = w / 2;
+      if (r * 2 > h) r = h / 2;
+      s.fillRect(x + r, y, w - 2 * r, h, c);
+      s.fillRect(x, y + r, w, h - 2 * r, c);
+      if (r > 0) {
+        s.fillCircle(x + r,         y + r,         r, c);
+        s.fillCircle(x + w - r - 1, y + r,         r, c);
+        s.fillCircle(x + r,         y + h - r - 1, r, c);
+        s.fillCircle(x + w - r - 1, y + h - r - 1, r, c);
+      }
+    };
+
+    // Bounding box of a shape, clipped to the eye area.
+    auto bbox = [&](const Shape& s, int16_t& x, int16_t& y, int16_t& w, int16_t& h) {
+      int16_t cx = CX + s.dx, cy = CY + s.dy;
+      if (s.style == HAPPY) { x = cx - s.w / 2 - 1; y = cy - s.w / 2 - 1; w = s.w + 2; h = s.w / 2 + 8; }
+      else if (s.style == FLAT) { x = cx - s.w / 2; y = cy - 3; w = s.w; h = 6; }
+      else { x = cx - s.w / 2; y = cy - s.h / 2; w = s.w; h = s.h; }
+      if (x < 0) { w += x; x = 0; }
+      if (y < 0) { h += y; y = 0; }
+      if (x + w > W) w = W - x;
+      if (y + h > EYE_MAX_Y) h = EYE_MAX_Y - y;
+    };
+
+    auto drawShape = [&](ST7735_TFT& s, const Shape& e) {
+      int16_t cx = CX + e.dx, cy = CY + e.dy;
+      if (e.style == HAPPY) {
+        // Upward crescent "^": a disc with a black disc bitten out underneath.
+        int16_t r = e.w / 2;
+        s.fillCircle(cx, cy, r, e.col);
+        s.fillCircle(cx, cy + 14, r, C_BLACK);
+        s.fillRect(cx - r - 1, cy + 6, e.w + 3, r, C_BLACK);
+      } else if (e.style == FLAT) {
+        rrect(s, cx - e.w / 2, cy - 2, e.w, 4, 2, e.col);
+      } else {
+        rrect(s, cx - e.w / 2, cy - e.h / 2, e.w, e.h, 16, e.col);
+      }
+      // Never let the eye bleed into the caption strip.
+      s.fillRect(0, EYE_MAX_Y, W, CAP_Y - EYE_MAX_Y, C_BLACK);
+    };
+
+    auto drawCaption = [&](ST7735_TFT& s, const char* text, uint16_t col) {
+      // Up to 26 chars, wrapped into two centred lines of 13.
+      s.fillRect(0, CAP_Y, W, CAP_H, C_BLACK);
+      int16_t len = strlen(text);
+      char part[14];
+      for (int16_t ln = 0; ln < 2 && ln * 13 < len; ln++) {
+        int16_t n = len - ln * 13;
+        if (n > 13) n = 13;
+        memcpy(part, text + ln * 13, n);
+        part[n] = 0;
+        s.displayText(part, (W - n * 6) / 2, CAP_Y + 2 + ln * 11, 1, col);
+      }
+    };
+
+    auto drawVolume = [&](ST7735_TFT& s) {
+      s.fillRect(0, CAP_Y, W, CAP_H, C_BLACK);
+      s.displayText("volume", 22, CAP_Y + 2, 1, C_GREY);
+      s.drawRect(4, CAP_Y + 13, 72, 7, C_GREY);
+      s.fillRect(6, CAP_Y + 15, (int16_t)(68 * vol), 3, C_ORANGE);
+    };
+
+    // Push a new eye shape: repaint only the union of old and new boxes.
+    auto render = [&](const Shape& n) {
+      if (!needFull && memcmp(&n, &cur, sizeof(Shape)) == 0) return;
+      for (uint8_t i = 0; i < 2; i++) {
+        ST7735_TFT& s = i == 0 ? eye_l : eye_r;
+        if (needFull) {
+          s.fillScreen(C_BLACK);
+          drawShape(s, n);
+          if (volVisible && i == 1) drawVolume(s);
+          else drawCaption(s, i == 0 ? label : detail, i == 0 ? C_ORANGE : C_GREY);
+          s.display();
+        } else {
+          int16_t ox, oy, ow, oh, nx, ny, nw, nh;
+          bbox(cur, ox, oy, ow, oh);
+          bbox(n, nx, ny, nw, nh);
+          int16_t x0 = min(ox, nx), y0 = min(oy, ny);
+          int16_t x1 = max(ox + ow, nx + nw), y1 = max(oy + oh, ny + nh);
+          if (x0 > 0) x0--;
+          if (y0 > 0) y0--;
+          if (x1 < W) x1++;
+          if (y1 > EYE_MAX_Y) y1 = EYE_MAX_Y;
+          if (x1 <= x0 || y1 <= y0) continue;
+          s.fillRect(x0, y0, x1 - x0, y1 - y0, C_BLACK);
+          drawShape(s, n);
+          s.displayRegion(x0, y0, x1 - x0, y1 - y0);
+        }
+      }
+      if (needFull) capDirty = false;
+      needFull = false;
+      cur = n;
+    };
+
+    auto pushCaptions = [&]() {
+      drawCaption(eye_l, label, C_ORANGE);
+      eye_l.displayRegion(0, CAP_Y, W, CAP_H);
+      if (volVisible) drawVolume(eye_r);
+      else drawCaption(eye_r, detail, C_GREY);
+      eye_r.displayRegion(0, CAP_Y, W, CAP_H);
+      capDirty = false;
+    };
+
+    auto setMood = [&](Mood m) {
+      lastActivity = now;
+      if (m == mood) return;
+      mood = m;
+      moodSince = now;
+      t = 0.0f;
+      needFull = true;
+      blinkUntil = 0;
+      if (spk.isPlaying() || talking) return;   // never chirp over speech
+      switch (m) {
+        case WAITING: spk.playNote(NOTE_E5, 80); spk.playNote(NOTE_A5, 120); break;
+        case DONE:    spk.playNote(NOTE_C5, 80); spk.playNote(NOTE_E5, 80); spk.playNote(NOTE_G5, 140); break;
+        case ERR:     spk.playNote(NOTE_E4, 120); spk.playNote(NOTE_C4, 200); break;
+        default: break;
+      }
+    };
+
+    auto copyText = [](char* dst, const char* src) {
+      int i = 0;
+      for (; src[i] && i < 26; i++) dst[i] = (src[i] >= 32 && src[i] < 127) ? src[i] : '?';
+      dst[i] = 0;
+    };
+
+    // Extract "name":"<value>" in place; value must not contain quotes.
+    auto field = [](char* l, const char* name) -> char* {
+      char pat[20];
+      snprintf(pat, sizeof(pat), "\"%s\":\"", name);
+      char* p = strstr(l, pat);
+      if (!p) return nullptr;
+      p += strlen(pat);
+      char* q = strchr(p, '"');
+      if (!q) return nullptr;
+      *q = 0;
+      return p;
+    };
+
+    auto b64 = [](const uint8_t* in, int n, char* out) {
+      static const char T[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+      int o = 0;
+      for (int i = 0; i < n; i += 3) {
+        uint32_t v = (uint32_t)in[i] << 16;
+        if (i + 1 < n) v |= (uint32_t)in[i + 1] << 8;
+        if (i + 2 < n) v |= in[i + 2];
+        out[o++] = T[(v >> 18) & 63];
+        out[o++] = T[(v >> 12) & 63];
+        out[o++] = i + 1 < n ? T[(v >> 6) & 63] : '=';
+        out[o++] = i + 2 < n ? T[v & 63] : '=';
+      }
+      out[o] = 0;
+    };
+
+    auto sendAudio = [&]() {
+      if (pcmN == 0) return;
+      static char enc[700];
+      b64((const uint8_t*)pcmBuf, pcmN * 2, enc);
+      Serial.print("{\"type\":\"event\",\"payload\":{\"event_type\":\"sensor\",\"key\":\"mic_audio\",\"value\":\"");
+      Serial.print(enc);
+      Serial.println("\",\"source\":\"microphone\"}}");
+      pcmN = 0;
+    };
+
+    auto moodFrom = [](const char* v, Mood fallback) -> Mood {
+      if (!strcmp(v, "idle"))      return IDLE;
+      if (!strcmp(v, "thinking"))  return THINKING;
+      if (!strcmp(v, "tool"))      return TOOL;
+      if (!strcmp(v, "waiting"))   return WAITING;
+      if (!strcmp(v, "done"))      return DONE;
+      if (!strcmp(v, "listening")) return LISTENING;
+      if (!strcmp(v, "speaking"))  return SPEAKING;
+      if (!strcmp(v, "error"))     return ERR;
+      if (!strcmp(v, "sleep"))     return SLEEP;
+      return fallback;
+    };
+
+    auto handleLine = [&](char* l) {
+      char* v = field(l, "value");
+      char* a = field(l, "action");
+      if (!a) return;
+      if (!v) v = (char*)"";
+      if (!strcmp(a, "spk_play_pcm")) { spk.playPCMBase64(v); lastActivity = now; return; }
+      if (!strcmp(a, "mood"))   { setMood(moodFrom(v, mood)); return; }
+      if (!strcmp(a, "label"))  { copyText(label, v);  capDirty = true; lastActivity = now; return; }
+      if (!strcmp(a, "detail")) { copyText(detail, v); capDirty = true; lastActivity = now; return; }
+      if (!strcmp(a, "spk_stop")) { spk.stop(); return; }
+      if (!strcmp(a, "orient_l")) { eye_l.setCanvasRotation(atoi(v)); needFull = true; return; }
+      if (!strcmp(a, "orient_r")) { eye_r.setCanvasRotation(atoi(v)); needFull = true; return; }
+      if (!strcmp(a, "ping")) {
+        Serial.println("{\"type\":\"event\",\"payload\":{\"event_type\":\"state\",\"key\":\"pong\",\"value\":\"clawd_bot\"}}");
+      }
+    };
+
+    // ======================= 1. serial in =======================
+    // Bounded per loop so a burst of PCM can't starve the animation.
+    for (int handled = 0; handled < 6 && Serial.available() > 0; ) {
+      int c = Serial.read();
+      if (c < 0) break;
+      if (c == '\n') {
+        line[lineN] = 0;
+        if (!lineOverflow && lineN > 0) handleLine(line);
+        lineN = 0;
+        lineOverflow = false;
+        handled++;
+      } else if (c != '\r') {
+        if (lineN < (int)sizeof(line) - 1) line[lineN++] = (char)c;
+        else lineOverflow = true;
+      }
+    }
+
+    // ======================= 2. push-to-talk =======================
+    bool down = btn.isPressed();
+    if (down && !wasDown) {
+      spk.stop();
+      mic.startStream();
+      talking = true;
+      talkStart = now;
+      pcmN = 0;
+      copyText(label, "listening");
+      copyText(detail, "");
+      capDirty = true;
+      setMood(LISTENING);
+    }
+    if (talking) {
+      int got;
+      for (int k = 0; k < 8; k++) {
+        got = mic.readStream(pcmBuf + pcmN, 256 - pcmN);
+        pcmN += got;
+        if (pcmN == 256) sendAudio();
+        if (got == 0) break;
+      }
+      if ((!down && wasDown) || now - talkStart > 60000UL) {
+        // Flush everything captured up to the release, then mark the end.
+        while ((got = mic.readStream(pcmBuf + pcmN, 256 - pcmN)) > 0) {
+          pcmN += got;
+          if (pcmN == 256) sendAudio();
+        }
+        sendAudio();
+        mic.stopStream();
+        talking = false;
+        Serial.print("{\"type\":\"event\",\"payload\":{\"event_type\":\"state\",\"key\":\"ptt\",\"value\":\"end\",\"overruns\":");
+        Serial.print((unsigned long)mic.streamOverruns());
+        Serial.println("}}");
+        copyText(label, "heard you");
+        capDirty = true;
+        setMood(THINKING);
+      }
+    }
+    wasDown = down;
+
+    // ======================= 3. volume knob =======================
+    int32_t pos = knob.getPosition();
+    if (pos != lastKnob) {
+      vol += (pos - lastKnob) * 0.02f;
+      if (vol < 0.0f) vol = 0.0f;
+      if (vol > 1.0f) vol = 1.0f;
+      lastKnob = pos;
+      spk.setVolume(vol);
+      knob.setRingPosition(vol * 12.0f);
+      volVisible = true;
+      volShownAt = now;
+      capDirty = true;
+      lastActivity = now;
+      Serial.print("{\"type\":\"event\",\"payload\":{\"event_type\":\"sensor\",\"key\":\"volume\",\"value\":");
+      Serial.print((int)(vol * 100 + 0.5f));
+      Serial.println(",\"source\":\"rotary_encoder\"}}");
+    }
+    if (volVisible && now - volShownAt > 1500) { volVisible = false; capDirty = true; }
+
+    // ======================= 4. mood timeouts =======================
+    uint32_t inMood = now - moodSince;
+    if (mood == DONE && inMood > 10000)           setMood(IDLE);
+    if (mood == ERR && inMood > 6000)             setMood(IDLE);
+    if (mood == WAITING && inMood > 300000UL)     setMood(IDLE);
+    if (mood == SPEAKING && inMood > 2000 && now - lastActivity > 1500 && !spk.isPlaying()) setMood(IDLE);
+    if (mood == IDLE && now - lastActivity > SLEEP_AFTER_MS) { mood = SLEEP; moodSince = now; needFull = true; }
+
+    // ======================= 5. eyes =======================
+    uint32_t frameMs = (mood == SPEAKING) ? 120 : 40;   // keep I2S fed while talking
+    if (needFull || now - lastFrame >= frameMs) {
+      lastFrame = now;
+      t += frameMs / 1000.0f;
+      Shape s = {0, 0, 46, 84, C_ORANGE, PILL};
+
+      // Shared idle-style gaze: hop to a new point, ease toward it.
+      if (now >= nextGlance) {
+        const int8_t gx[] = {-12, -6, 0, 0, 6, 12};
+        const int8_t gy[] = {-16, 0, 0, 10};
+        tgtX = gx[random(6)];
+        tgtY = gy[random(4)];
+        nextGlance = now + 1800 + random(3200);
+      }
+      gazeX += (tgtX - gazeX) / 3 + (tgtX > gazeX) - (tgtX < gazeX);
+      gazeY += (tgtY - gazeY) / 3 + (tgtY > gazeY) - (tgtY < gazeY);
+
+      switch (mood) {
+        case IDLE:
+          s.dx = gazeX; s.dy = gazeY;
+          break;
+        case THINKING:   // eyes up and drifting in a slow circle
+          s = {(int16_t)(10 * cosf(t * 1.6f)), (int16_t)(-20 + 8 * sinf(t * 1.6f)), 40, 62, C_ORANGE, PILL};
+          break;
+        case TOOL:       // narrowed, looking down, scanning like reading
+          s = {(int16_t)(12 * sinf(t * 3.0f)), 18, 52, 34, C_ORANGE, PILL};
+          break;
+        case WAITING:    // wide, amber, bouncing - "your turn"
+          s = {0, (int16_t)(-3 + 6 * fabsf(sinf(t * 5.0f))), 60, 108, C_AMBER, PILL};
+          break;
+        case DONE:
+          s = {0, (int16_t)(4 + 3 * sinf(t * 3.0f)), 58, 0, C_ORANGE, HAPPY};
+          break;
+        case LISTENING: {
+          int16_t lv = mic.getSoundLevel() / 25;
+          if (lv > 44) lv = 44;
+          s = {0, 0, 52, (int16_t)(72 + lv), C_BLUE, PILL};
+          break;
+        }
+        case SPEAKING:
+          s = {0, (int16_t)(3 * sinf(t * 6.0f)), 46, 80, C_ORANGE, PILL};
+          break;
+        case ERR:
+          s = {0, 8, 56, 18, C_RED, PILL};
+          break;
+        case SLEEP:
+          s = {0, 20, 50, 0, C_DIM, FLAT};
+          break;
+      }
+
+      // Blink (moods with open pill eyes only).
+      if (mood == IDLE || mood == THINKING || mood == WAITING || mood == SPEAKING) {
+        if (blinkUntil == 0 && now >= nextBlink) {
+          blinkUntil = now + 120;
+          nextBlink = now + (mood == WAITING ? 1500 : 2500 + random(3500));
+        }
+        if (blinkUntil) {
+          if (now < blinkUntil) s.style = FLAT;
+          else blinkUntil = 0;
+        }
+      }
+      render(s);
+      if (capDirty) pushCaptions();
+    }
+
+    // ======================= 6. status LED =======================
+    if (now - lastLed >= 50) {
+      lastLed = now;
+      float ph = (now % 100000UL) / 1000.0f;
+      float breath = 0.5f + 0.5f * sinf(ph * 2.0f);
+      led.clear();
+      switch (mood) {
+        case IDLE:     led.setAll(60, 25, 10); break;
+        case THINKING: led.setAll((uint8_t)(40 + 180 * breath), (uint8_t)(15 + 70 * breath), (uint8_t)(5 + 25 * breath)); break;
+        case TOOL: {
+          const uint8_t ring[] = {0, 1, 2, 5, 8, 7, 6, 3};
+          uint8_t head = (now / 90) % 8;
+          for (uint8_t i = 0; i < 8; i++) {
+            uint8_t d = (head + 8 - i) % 8;   // distance behind the head
+            uint8_t k = d == 0 ? 255 : d == 1 ? 90 : d == 2 ? 30 : 0;
+            led.setPixel(ring[i], (uint8_t)(217 * k / 255), (uint8_t)(119 * k / 255), (uint8_t)(87 * k / 255));
+          }
+          led.setPixel(4, 30, 12, 5);
+          break;
+        }
+        case WAITING: {
+          float fast = 0.5f + 0.5f * sinf(ph * 6.0f);
+          led.setAll((uint8_t)(255 * fast), (uint8_t)(170 * fast), 0);
+          break;
+        }
+        case DONE:      led.setAll(40, 200, 70); break;
+        case LISTENING: {
+          int16_t lv = mic.getSoundLevel() / 10;
+          if (lv > 200) lv = 200;
+          led.setAll(20, (uint8_t)(60 + lv / 3), (uint8_t)(55 + lv));
+          break;
+        }
+        case SPEAKING:  led.setAll((uint8_t)(120 + 120 * breath), (uint8_t)(110 + 110 * breath), (uint8_t)(100 + 100 * breath)); break;
+        case ERR:       if ((now / 250) % 2) led.setAll(255, 0, 0); break;
+        case SLEEP:     break;
+      }
+      led.show();
+    }

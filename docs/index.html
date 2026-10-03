@@ -1,0 +1,502 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="description" content="Clawd bot: an open-source desk robot that shows what Claude Code is doing on two screen eyes, and lets you talk to a Claude Code session by voice.">
+<title>Clawd bot</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Pixelify+Sans:wght@500;700&family=Figtree:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+<style>
+/* Layout: one live "desk" stage up top (the buddy itself, operable), then a
+   quiet reference column: parts, port map, data path, open issues. */
+:root {
+  --bg: #eef0f3;          /* cool slate paper, biased toward the screen blue */
+  --surface: #ffffff;
+  --ink: #1b1f26;
+  --muted: #5d6573;
+  --line: #d5d9e0;
+  --clawd: #d97757;       /* the mascot orange: PRINT_ME.md #D97757 */
+  --clawd-deep: #b45f43;
+  --clawd-shade: #9c4f37;
+  --desk: #2a2622;
+  --glass: #07090c;
+  --ok: #2f9e55; --warn: #c98a00; --bad: #d23f45;
+  --f-display: "Pixelify Sans", "Courier New", monospace;
+  --f-body: "Figtree", system-ui, -apple-system, "Segoe UI", sans-serif;
+  --f-mono: "JetBrains Mono", ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --r: 10px;
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121418; --surface: #1a1d23; --ink: #e8eaee; --muted: #9aa2b1; --line: #2c313a;
+    --desk: #0c0b0a; --clawd-shade: #8a452f;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121418; --surface: #1a1d23; --ink: #e8eaee; --muted: #9aa2b1; --line: #2c313a;
+  --desk: #0c0b0a; --clawd-shade: #8a452f;
+}
+* { box-sizing: border-box; }
+html { color-scheme: light; }
+body { margin: 0; }
+img { max-width: 100%; }
+[hidden] { display: none !important; }
+body { background: var(--bg); color: var(--ink); font: 400 16px/1.55 var(--f-body); padding-inline: 20px; }
+.wrap { max-width: 1080px; margin: 0 auto; padding-block: 28px 64px; display: grid; gap: 56px; }
+h1, h2 { font-family: var(--f-display); font-weight: 700; text-wrap: balance; margin: 0; letter-spacing: .01em; }
+h1 { font-size: clamp(2rem, 5vw, 3.1rem); line-height: 1.05; }
+h2 { font-size: 1.55rem; }
+p { margin: 0; max-width: 65ch; }
+.lede { color: var(--muted); font-size: 1.05rem; }
+.eyebrow { font: 500 .74rem/1 var(--f-mono); text-transform: uppercase; letter-spacing: .12em; color: var(--clawd-deep); }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) .eyebrow { color: var(--clawd); } }
+:root[data-theme="dark"] .eyebrow { color: var(--clawd); }
+code, .mono { font-family: var(--f-mono); font-size: .86em; }
+section { display: grid; gap: 18px; }
+header { display: grid; gap: 12px; }
+
+/* ---------- stage ---------- */
+.stage { background: var(--desk); border-radius: 18px; padding: clamp(18px, 4vw, 40px); display: grid; grid-template-columns: minmax(0, 1fr) 250px; gap: 28px; align-items: center; color: #efe9e4; }
+@media (max-width: 820px) { .stage { grid-template-columns: 1fr; } }
+.clawd { position: relative; width: 100%; max-width: 560px; margin: 0 auto; aspect-ratio: 10 / 7; }
+.clawd .px { position: absolute; background: var(--clawd); }
+.clawd .px.shade { background: var(--clawd-shade); }
+.screen { position: absolute; top: 9%; width: 12.5%; aspect-ratio: 19.5 / 39.5; background: #000; border-radius: 3px; padding: 0.8% 0.7%; box-shadow: 0 0 0 3px #15171b, 0 6px 18px rgba(0,0,0,.45); }
+.screen canvas { display: block; width: 100%; height: 100%; image-rendering: pixelated; border-radius: 1px; }
+.screen.l { left: 29%; } .screen.r { left: 58.5%; }
+
+.panel { display: grid; gap: 18px; justify-items: start; }
+.panel .k { font: 500 .7rem/1 var(--f-mono); letter-spacing: .12em; text-transform: uppercase; color: #a39a92; }
+.hw { display: flex; gap: 22px; align-items: center; flex-wrap: wrap; }
+.hw figure { margin: 0; display: grid; gap: 8px; justify-items: center; }
+.hw figcaption { font: 400 .72rem/1 var(--f-mono); color: #a39a92; }
+.leds { display: grid; grid-template-columns: repeat(3, 18px); gap: 6px; padding: 10px; background: #111; border-radius: 6px; }
+.leds i { width: 18px; height: 18px; border-radius: 50%; background: #222; transition: background-color 60ms linear, box-shadow 60ms linear; }
+.ring { width: 84px; height: 84px; }
+.now { display: grid; gap: 4px; }
+.now b { font: 700 1.35rem/1.1 var(--f-display); color: var(--clawd); }
+.now span { font-size: .9rem; color: #cfc6be; max-width: 30ch; }
+.now .trig { font: 400 .76rem/1.4 var(--f-mono); color: #a39a92; }
+
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.chip { font: 500 .85rem/1 var(--f-body); color: var(--ink); background: var(--surface); border: 1px solid var(--line); border-radius: 999px; padding: 9px 14px; cursor: pointer; display: inline-flex; align-items: center; gap: 8px; }
+.chip .dot { width: 9px; height: 9px; border-radius: 50%; }
+.chip[aria-pressed="true"] { border-color: var(--clawd); box-shadow: inset 0 0 0 1px var(--clawd); }
+.chip:focus-visible, .play:focus-visible { outline: 2px solid var(--clawd); outline-offset: 2px; }
+.play { font: 600 .85rem/1 var(--f-body); background: var(--clawd); color: #1b1009; border: 0; border-radius: 999px; padding: 10px 16px; cursor: pointer; }
+.sep { width: 1px; height: 24px; background: var(--line); margin-inline: 4px; }
+
+/* ---------- parts ---------- */
+.parts { display: grid; grid-template-columns: repeat(auto-fill, minmax(220px, 1fr)); gap: 14px; }
+.part { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); overflow: hidden; display: grid; grid-template-rows: auto 1fr; }
+.part img { width: 100%; aspect-ratio: 4 / 3; object-fit: cover; background: #f4f4f4; display: block; }
+.part .body { padding: 12px 14px 14px; display: grid; gap: 6px; align-content: start; }
+.part h3 { margin: 0; font: 600 1rem/1.25 var(--f-body); display: flex; justify-content: space-between; gap: 8px; }
+.part h3 .mono { color: var(--muted); font-weight: 400; }
+.part p { font-size: .9rem; color: var(--muted); }
+.part .meta { font: 400 .76rem/1.4 var(--f-mono); color: var(--muted); font-variant-numeric: tabular-nums; }
+
+/* ---------- port map + flow ---------- */
+.two { display: grid; grid-template-columns: minmax(0, 340px) minmax(0, 1fr); gap: 28px; align-items: start; }
+@media (max-width: 820px) { .two { grid-template-columns: 1fr; } }
+.diagram { overflow-x: auto; }
+.diagram svg { display: block; width: 100%; height: auto; max-width: 340px; }
+.diagram text { font-family: var(--f-mono); }
+.flow { display: grid; gap: 10px; }
+.lane { background: var(--surface); border: 1px solid var(--line); border-radius: var(--r); padding: 14px 16px; display: grid; gap: 8px; }
+.lane h3 { margin: 0; font: 600 .95rem/1.3 var(--f-body); }
+.steps { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font: 400 .8rem/1.3 var(--f-mono); }
+.steps span { background: var(--bg); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }
+.steps em { font-style: normal; color: var(--muted); }
+pre { margin: 0; overflow-x: auto; background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; font: 400 .78rem/1.5 var(--f-mono); }
+
+/* ---------- issues ---------- */
+.issues { display: grid; gap: 10px; }
+.issue { display: grid; grid-template-columns: 92px 1fr; gap: 14px; align-items: baseline; padding: 12px 0; border-top: 1px solid var(--line); }
+.issue:first-child { border-top: 0; }
+.tag { font: 500 .7rem/1 var(--f-mono); letter-spacing: .08em; text-transform: uppercase; padding: 5px 7px; border-radius: 5px; justify-self: start; }
+.tag.v { background: color-mix(in srgb, var(--ok) 16%, transparent); color: var(--ok); }
+.tag.u { background: color-mix(in srgb, var(--warn) 18%, transparent); color: var(--warn); }
+.tag.x { background: color-mix(in srgb, var(--bad) 15%, transparent); color: var(--bad); }
+.issue p { font-size: .94rem; }
+@media (max-width: 480px) { .issue { grid-template-columns: 1fr; gap: 6px; } }
+@media (prefers-reduced-motion: reduce) { .leds i { transition: none; } }
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">Atech 14-port · 7 modules · all 12 slots</div>
+    <h1>Clawd bot</h1>
+    <p class="lede">Two screens for eyes that show what Claude Code is doing right now. Hold the button to talk to a Claude Code session; Clawd answers through its speaker. The knob sets the volume and its press cancels.</p>
+  </header>
+
+  <section aria-label="Live preview">
+    <div class="stage">
+      <div class="clawd" id="clawd">
+        <div class="screen l"><canvas id="eyeL" width="80" height="160" aria-label="Left eye screen"></canvas></div>
+        <div class="screen r"><canvas id="eyeR" width="80" height="160" aria-label="Right eye screen"></canvas></div>
+      </div>
+      <div class="panel">
+        <div class="now" aria-live="polite">
+          <span class="k">Mood</span>
+          <b id="moodName">Idle</b>
+          <span id="moodDesc"></span>
+          <span class="trig" id="moodTrig"></span>
+        </div>
+        <div class="hw">
+          <figure><div class="leds" id="leds" aria-label="NeoPixel 3x3"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div><figcaption>led · port 11</figcaption></figure>
+          <figure><canvas class="ring" id="ring" width="168" height="168" aria-label="Knob volume ring"></canvas><figcaption>knob · vol <span id="volTxt">40</span>%</figcaption></figure>
+        </div>
+      </div>
+    </div>
+    <div class="controls" role="group" aria-label="Choose a mood">
+      <button class="play" id="play" type="button">Pause scenario</button>
+      <span class="sep" aria-hidden="true"></span>
+      <span id="chips" style="display:contents"></span>
+    </div>
+    <p class="lede" style="font-size:.92rem">The eyes run the firmware's animation logic, ported line for line: same shapes, timings, colours and captions, at the screens' real resolution, mounted portrait (80×160). The autoplay walks through one voice turn. Click a mood to hold it.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">Build one</div>
+    <h2>Get started</h2>
+    <p class="lede">You need an Atech 14-port board, the seven modules below, a printed case, and Python 3.10 or newer. Voice also needs an OpenAI API key for speech-to-text and text-to-speech.</p>
+<pre>pip install -r bridge/requirements.txt          # atech, openai, pyserial
+atech validate firmware && atech upload firmware  # check the UP arrow on each eye at boot
+
+python bridge/clawd_bridge.py install-hooks       # once; backs up ~/.claude/settings.json
+python bridge/clawd_bridge.py demo                # cycle every mood
+export OPENAI_API_KEY=...
+python bridge/clawd_bridge.py run --workdir ~/code/my-project</pre>
+    <p class="lede" style="font-size:.92rem">Print <code>case/Clawd_Case_v2.stl</code> as one piece, as it comes, with no rotation; settings are in <code>case/PRINT_ME.md</code>.</p>
+  </section>
+
+  <section>
+    <div class="eyebrow">Inside</div>
+    <h2>The seven parts</h2>
+    <div class="parts" id="parts"></div>
+  </section>
+
+  <section>
+    <div class="eyebrow">Wiring</div>
+    <h2>Ports and data path</h2>
+    <div class="two">
+      <div class="diagram" id="portmap"></div>
+      <div class="flow">
+        <div class="lane">
+          <h3>Mirroring Claude Code</h3>
+          <div class="steps"><span>Claude Code hook</span><em>→ curl POST</em><span>bridge :8765</span><em>→ USB serial</em><span>mood + captions</span></div>
+          <p class="lede" style="font-size:.88rem">Global hooks in <code>~/.claude/settings.json</code>, so every session on this PC drives the face. With the bridge stopped, a hook fails in milliseconds and never blocks Claude.</p>
+        </div>
+        <div class="lane">
+          <h3>Talking to it</h3>
+          <div class="steps"><span>hold button</span><em>→</em><span>mic 16 kHz stream</span><em>→</em><span>OpenAI transcribe</span><em>→</em><span>claude -p --resume</span><em>→</em><span>OpenAI TTS</span><em>→</em><span>speaker</span></div>
+          <p class="lede" style="font-size:.88rem">Voice prompts go to one dedicated session per project folder, so follow-ups keep context. The tool calls it makes show on the eyes like any other session.</p>
+        </div>
+        <pre>{"action":"mood","value":"tool"}
+{"action":"label","value":"Bash"}
+{"action":"detail","value":"npm test"}
+{"action":"spk_play_pcm","value":"&lt;base64, 512 samples&gt;"}</pre>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <div class="eyebrow">Status</div>
+    <h2>What is proven and what isn't</h2>
+    <div class="issues">
+      <div class="issue"><span class="tag v">built</span><p>Firmware compiles for the 14-port (RAM 8.6%, flash 9.7%). Bridge tested offline against a mock board: hook mapping, caption sanitising, resampling and hook install/uninstall.</p></div>
+      <div class="issue"><span class="tag v">on hardware</span><p>Eye pairs 1+2 and 5+6 drive the screens. The generator emits the same constructor pins as the confirmed <code>clawd_eyes</code> build.</p></div>
+      <div class="issue"><span class="tag u">untested</span><p>Pairs 3+4 (mic), 9+10 (knob) and 13+14 (speaker) have never been the primary of a tested pair on this board. Audio over USB in both directions has not run on a real board yet.</p></div>
+      <div class="issue"><span class="tag x">case</span><p>The printed case has eye openings only. The button, knob and LED need holes. The speaker doesn't fit inside: CAD notes measure an 11 mm shortfall, so it hangs on a cable.</p></div>
+    </div>
+  </section>
+</div>
+
+<script>
+(() => {
+  // ---------------- palette (RGB565 values from the firmware, as CSS) -------
+  const C = { orange: "#d97757", amber: "#ffb000", blue: "#5ac8fa", red: "#e5484d", dim: "#6b3a2b", grey: "#848484" };
+  // Portrait: the screens are mounted vertically, so each eye is 80 x 160.
+  const W = 80, CX = 40, CY = 68, EYE_MAX_Y = 136, CAP_Y = 137;
+
+  const MOODS = {
+    idle:      { name: "Idle",      dot: C.orange, desc: "Nothing running. Glances around and blinks.", trig: "SessionStart · after speaking" },
+    thinking:  { name: "Thinking",  dot: C.orange, desc: "Eyes drift up in a slow circle.", trig: "UserPromptSubmit · PostToolUse" },
+    tool:      { name: "Tool",      dot: C.orange, desc: "Narrowed eyes scan like reading. Captions show the tool and its argument.", trig: "PreToolUse" },
+    waiting:   { name: "Waiting",   dot: C.amber,  desc: "Wide amber eyes bounce, with an E–A chime. It's your turn.", trig: "Notification (permission, idle prompt)" },
+    done:      { name: "Done",      dot: "#3fb950", desc: "Happy eyes and a C–E–G chime, for 10 seconds.", trig: "Stop" },
+    listening: { name: "Listening", dot: C.blue,   desc: "Blue eyes stretch with your voice level while the button is held.", trig: "button held" },
+    speaking:  { name: "Speaking",  dot: "#e8e2da", desc: "Eyes bob gently while the reply plays.", trig: "spk_play_pcm stream" },
+    error:     { name: "Error",     dot: C.red,    desc: "Flat red eyes and a low two-note tone, then back to idle.", trig: "voice turn failed" },
+    sleep:     { name: "Sleep",     dot: C.dim,    desc: "Dim closed lines, LED off. Any event wakes it.", trig: "10 min without activity" },
+  };
+
+  // One voice turn, as the bridge would drive it.
+  const SCENARIO = [
+    ["idle", "hi!", "my-app", 3200], ["listening", "listening", "", 3000],
+    ["thinking", "you said", "run the tests and fix~", 2600], ["tool", "Bash", "npm test", 3000],
+    ["thinking", "thinking", "", 1800], ["tool", "Edit", "auth.test.ts", 2600],
+    ["waiting", "needs you", "allow Bash: git push", 3600], ["tool", "Bash", "git push", 2000],
+    ["done", "done", "", 3200], ["speaking", "", "", 3600], ["idle", "", "", 4200], ["sleep", "", "", 3000],
+  ];
+
+  // ---------------- canvas setup ----------------
+  const eyes = [document.getElementById("eyeL"), document.getElementById("eyeR")].map(c => {
+    const ctx = c.getContext("2d");
+    return { c, ctx };
+  });
+  const ring = document.getElementById("ring").getContext("2d");
+  const ledEls = [...document.querySelectorAll("#leds i")];
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
+
+  // ---------------- Clawd silhouette (10 x 7 pixel cells, 17 mm each) -----
+  const body = [
+    ".########.",
+    ".########.",
+    "##########",
+    "##########",
+    ".########.",
+    ".##.##.##.",
+    ".##.##.##.",
+  ];
+  const clawd = document.getElementById("clawd");
+  body.forEach((row, y) => [...row].forEach((ch, x) => {
+    if (ch !== "#") return;
+    const d = document.createElement("div");
+    d.className = "px" + ((x === 0 || x === 9) ? " shade" : "");
+    Object.assign(d.style, { left: `${x * 10}%`, top: `${y * (100 / 7)}%`, width: "10.2%", height: `${100 / 7 + 0.3}%` });
+    clawd.prepend(d);
+  }));
+
+  // ---------------- state (mirrors the firmware's statics) ----------------
+  const st = {
+    mood: "idle", since: 0, t: 0, label: "hi!", detail: "my-app",
+    gazeX: 0, gazeY: 0, tgtX: 0, tgtY: 0, nextGlance: 2000, nextBlink: 3000, blinkUntil: 0,
+    vol: 0.4, level: 0,
+  };
+  const rnd = n => Math.floor(Math.random() * n);
+
+  function setMood(m, label, detail) {
+    if (label !== undefined) st.label = label;
+    if (detail !== undefined) st.detail = detail;
+    if (m !== st.mood) { st.mood = m; st.since = performance.now(); st.t = 0; st.blinkUntil = 0; }
+    const M = MOODS[m];
+    document.getElementById("moodName").textContent = M.name;
+    document.getElementById("moodDesc").textContent = M.desc;
+    document.getElementById("moodTrig").textContent = "trigger: " + M.trig;
+    document.querySelectorAll(".chip").forEach(b => b.setAttribute("aria-pressed", b.dataset.m === m));
+  }
+
+  // ---------------- drawing, same geometry as drawShape() ----------------
+  function rrect(g, x, y, w, h, r, col) {
+    if (w <= 0 || h <= 0) return;
+    r = Math.min(r, w / 2, h / 2);
+    g.fillStyle = col;
+    g.beginPath(); g.roundRect(x, y, w, h, r); g.fill();
+  }
+  function drawShape(g, s) {
+    const cx = CX + s.dx, cy = CY + s.dy;
+    if (s.style === "happy") {
+      const r = s.w / 2;
+      g.fillStyle = s.col; g.beginPath(); g.arc(cx, cy, r, 0, 7); g.fill();
+      g.fillStyle = "#000"; g.beginPath(); g.arc(cx, cy + 14, r, 0, 7); g.fill();
+      g.fillRect(cx - r - 1, cy + 6, s.w + 3, r);
+    } else if (s.style === "flat") {
+      rrect(g, cx - s.w / 2, cy - 2, s.w, 4, 2, s.col);
+    } else {
+      rrect(g, cx - s.w / 2, cy - s.h / 2, s.w, s.h, 16, s.col);
+    }
+    g.fillStyle = "#000"; g.fillRect(0, EYE_MAX_Y, W, 160 - EYE_MAX_Y);
+  }
+  function caption(g, text, col) {
+    if (!text) return;
+    g.fillStyle = col;
+    g.font = "8px 'JetBrains Mono', monospace";
+    g.textBaseline = "top";
+    // Two centred lines of 13 characters, like drawCaption() in the firmware.
+    for (let ln = 0; ln < 2 && ln * 13 < text.length; ln++) {
+      const part = text.slice(ln * 13, ln * 13 + 13);
+      g.fillText(part, (W - part.length * 6) / 2, CAP_Y + 2 + ln * 11, 78);
+    }
+  }
+
+  function shapeFor(now) {
+    let s = { dx: 0, dy: 0, w: 46, h: 84, col: C.orange, style: "pill" };
+    if (now >= st.nextGlance) {
+      st.tgtX = [-12, -6, 0, 0, 6, 12][rnd(6)];
+      st.tgtY = [-16, 0, 0, 10][rnd(4)];
+      st.nextGlance = now + 1800 + rnd(3200);
+    }
+    const ease = (a, b) => a + Math.trunc((b - a) / 3) + Math.sign(b - a);
+    st.gazeX = ease(st.gazeX, st.tgtX); st.gazeY = ease(st.gazeY, st.tgtY);
+    const t = st.t;
+    switch (st.mood) {
+      case "idle": s.dx = st.gazeX; s.dy = st.gazeY; break;
+      case "thinking": s = { dx: Math.trunc(10 * Math.cos(t * 1.6)), dy: Math.trunc(-20 + 8 * Math.sin(t * 1.6)), w: 40, h: 62, col: C.orange, style: "pill" }; break;
+      case "tool": s = { dx: Math.trunc(12 * Math.sin(t * 3)), dy: 18, w: 52, h: 34, col: C.orange, style: "pill" }; break;
+      case "waiting": s = { dx: 0, dy: Math.trunc(-3 + 6 * Math.abs(Math.sin(t * 5))), w: 60, h: 108, col: C.amber, style: "pill" }; break;
+      case "done": s = { dx: 0, dy: Math.trunc(4 + 3 * Math.sin(t * 3)), w: 58, h: 0, col: C.orange, style: "happy" }; break;
+      case "listening": s = { dx: 0, dy: 0, w: 52, h: 72 + Math.min(44, Math.trunc(st.level / 25)), col: C.blue, style: "pill" }; break;
+      case "speaking": s = { dx: 0, dy: Math.trunc(3 * Math.sin(t * 6)), w: 46, h: 80, col: C.orange, style: "pill" }; break;
+      case "error": s = { dx: 0, dy: 8, w: 56, h: 18, col: C.red, style: "pill" }; break;
+      case "sleep": s = { dx: 0, dy: 20, w: 50, h: 0, col: C.dim, style: "flat" }; break;
+    }
+    if (["idle", "thinking", "waiting", "speaking"].includes(st.mood)) {
+      if (!st.blinkUntil && now >= st.nextBlink) {
+        st.blinkUntil = now + 120;
+        st.nextBlink = now + (st.mood === "waiting" ? 1500 : 2500 + rnd(3500));
+      }
+      if (st.blinkUntil) { if (now < st.blinkUntil) s.style = "flat"; else st.blinkUntil = 0; }
+    }
+    return s;
+  }
+
+  function drawLeds(now) {
+    const ph = (now % 100000) / 1000, breath = 0.5 + 0.5 * Math.sin(ph * 2);
+    const px = Array(9).fill([0, 0, 0]);
+    const all = c => px.fill(c);
+    switch (st.mood) {
+      case "idle": all([60, 25, 10]); break;
+      case "thinking": all([40 + 180 * breath, 15 + 70 * breath, 5 + 25 * breath]); break;
+      case "tool": {
+        const order = [0, 1, 2, 5, 8, 7, 6, 3], head = Math.floor(now / 90) % 8;
+        order.forEach((idx, i) => { const d = (head + 8 - i) % 8; const k = [1, .35, .12][d] || 0; px[idx] = [217 * k, 119 * k, 87 * k]; });
+        px[4] = [30, 12, 5]; break;
+      }
+      case "waiting": { const f = 0.5 + 0.5 * Math.sin(ph * 6); all([255 * f, 170 * f, 0]); break; }
+      case "done": all([40, 200, 70]); break;
+      case "listening": { const lv = Math.min(200, st.level / 10); all([20, 60 + lv / 3, 55 + lv]); break; }
+      case "speaking": all([120 + 120 * breath, 110 + 110 * breath, 100 + 100 * breath]); break;
+      case "error": if (Math.floor(now / 250) % 2) all([255, 0, 0]); break;
+    }
+    ledEls.forEach((el, i) => {
+      const [r, g, b] = px[i].map(v => Math.round(v));
+      const on = r + g + b > 0;
+      // NeoPixels look brighter than their RGB value; lift dim values a little.
+      const lift = v => Math.min(255, Math.round(v * 1.25 + (on ? 18 : 0)));
+      el.style.backgroundColor = on ? `rgb(${lift(r)},${lift(g)},${lift(b)})` : "#222";
+      el.style.boxShadow = on ? `0 0 12px rgba(${r},${g},${b},.75)` : "none";
+    });
+  }
+
+  function drawRing() {
+    const g = ring, n = 12, cx = 84, cy = 84;
+    g.clearRect(0, 0, 168, 168);
+    g.fillStyle = "#151515"; g.beginPath(); g.arc(cx, cy, 80, 0, 7); g.fill();
+    g.fillStyle = "#2b2b2b"; g.beginPath(); g.arc(cx, cy, 44, 0, 7); g.fill();
+    const lit = st.vol * n;
+    for (let i = 0; i < n; i++) {
+      const a = -Math.PI / 2 + (i / n) * Math.PI * 2;
+      const on = i < lit;
+      g.fillStyle = on ? C.orange : "#3a3a3a";
+      g.shadowColor = on ? C.orange : "transparent"; g.shadowBlur = on ? 10 : 0;
+      g.beginPath(); g.arc(cx + Math.cos(a) * 62, cy + Math.sin(a) * 62, 7, 0, 7); g.fill();
+    }
+    g.shadowBlur = 0;
+    document.getElementById("volTxt").textContent = Math.round(st.vol * 100);
+  }
+
+  // ---------------- scenario + loop ----------------
+  let playing = !reduce, stepIdx = 0, stepEnds = 0, lastFrame = 0, lastLed = 0;
+  const playBtn = document.getElementById("play");
+  function setPlaying(p) { playing = p; playBtn.textContent = p ? "Pause scenario" : "Play scenario"; if (p) stepEnds = 0; }
+  playBtn.addEventListener("click", () => setPlaying(!playing));
+
+  const chips = document.getElementById("chips");
+  Object.entries(MOODS).forEach(([k, m]) => {
+    const b = document.createElement("button");
+    b.type = "button"; b.className = "chip"; b.dataset.m = k; b.id = "mood-" + k;
+    b.innerHTML = `<span class="dot" style="background:${m.dot}"></span>${m.name}`;
+    b.addEventListener("click", () => {
+      setPlaying(false);
+      const sample = SCENARIO.find(s => s[0] === k) || [k, "", ""];
+      setMood(k, sample[1], sample[2]);
+    });
+    chips.appendChild(b);
+  });
+
+  function frame(now) {
+    if (playing && now >= stepEnds) {
+      const [m, l, d, ms] = SCENARIO[stepIdx % SCENARIO.length];
+      setMood(m, l, d);
+      stepEnds = now + ms; stepIdx++;
+    }
+    // Simulated voice for "listening": syllable-like bursts.
+    st.level = st.mood === "listening" ? Math.max(0, 700 * Math.sin(now / 140) * Math.sin(now / 410) + 250 * Math.random()) : 0;
+    if (st.mood === "speaking" || st.mood === "listening") st.vol = st.vol; // knob is untouched in the demo
+
+    const frameMs = st.mood === "speaking" ? 120 : 40;
+    if (now - lastFrame >= frameMs) {
+      lastFrame = now; st.t += frameMs / 1000;
+      const s = shapeFor(now);
+      eyes.forEach(({ ctx }, i) => {
+        ctx.fillStyle = "#000"; ctx.fillRect(0, 0, 80, 160);
+        drawShape(ctx, s);
+        caption(ctx, i === 0 ? st.label : st.detail, i === 0 ? C.orange : C.grey);
+      });
+    }
+    if (now - lastLed >= 50) { lastLed = now; drawLeds(now); }
+    requestAnimationFrame(frame);
+  }
+
+  // Knob: scroll or arrow keys on the ring change volume, like turning it.
+  const ringEl = document.getElementById("ring");
+  ringEl.tabIndex = 0;
+  const nudge = d => { st.vol = Math.min(1, Math.max(0, st.vol + d * 0.02)); drawRing(); };
+  ringEl.addEventListener("wheel", e => { e.preventDefault(); nudge(e.deltaY < 0 ? 1 : -1); }, { passive: false });
+  ringEl.addEventListener("keydown", e => { if (e.key === "ArrowUp" || e.key === "ArrowRight") nudge(1); if (e.key === "ArrowDown" || e.key === "ArrowLeft") nudge(-1); });
+
+  setMood("idle", "hi!", "my-app");
+  drawRing();
+  requestAnimationFrame(frame);
+
+  // ---------------- parts ----------------
+  const PARTS = [
+    ["Screen ×2", "st7735_tft", "eye_l · eye_r", "ports 1+2, 5+6", "39.5 × 9.6 × 19.5", "Mounted portrait, so each eye is 80×160, drawn through a rotated canvas. Full repaint only on a mood change; every animation frame pushes just the changed box.", "img/screen.jpg"],
+    ["Microphone", "microphone", "mic", "ports 3+4", "39.5 × 10.8 × 19.5", "Streams 16 kHz audio while the button is held, via a new ring-buffer streaming API.", "img/microphone.jpg"],
+    ["Speaker", "speaker", "spk", "ports 13+14", "40.0 × 20.2 × 40.0", "Plays Claude's spoken reply and the mood chimes. Tethered by cable outside the case.", "img/speaker.jpg"],
+    ["Knob", "rotary_encoder", "knob", "ports 9+10", "39.5 × 29.6 × 39.5", "Turn for volume in 2% steps, shown on its 12-LED ring. Press to cancel speech or a running prompt.", "img/knob.jpg"],
+    ["Button", "button", "btn", "port 7", "19.5 × 10.0 × 19.5", "Push-to-talk. Hold and speak, release to send. Capped at 60 s.", "img/button.jpg"],
+    ["LED grid", "neopixel", "led", "port 11", "19.5 × 9.5 × 19.5", "3×3 status light: breathing, spinner, pulse, and so on, one pattern per mood.", "img/led-grid.jpg"],
+    ["14-port board", "14port", "", "8 = USB-C · 12 = reset", "60.0 × 7.0 × 120.0", "ESP32-S3. All twelve module slots are used.", "img/motherboard-14port.jpg"],
+  ];
+  document.getElementById("parts").innerHTML = PARTS.map(([n, id, inst, port, dim, desc, img]) => `
+    <article class="part">
+      <img src="${img}" alt="${n} render" loading="lazy">
+      <div class="body">
+        <h3>${n} <span class="mono">${inst}</span></h3>
+        <p>${desc}</p>
+        <div class="meta">${id} · ${port}<br>${dim} mm</div>
+      </div>
+    </article>`).join("");
+
+  // ---------------- port map (layout from 14port.yaml) ----------------
+  const PM = { 1: ["eye_l", C.orange], 2: ["eye_l", C.orange], 3: ["mic", "#7c8cff"], 4: ["mic", "#7c8cff"],
+    5: ["eye_r", C.orange], 6: ["eye_r", C.orange], 7: ["btn", "#3fb950"], 9: ["knob", "#c78bff"], 10: ["knob", "#c78bff"],
+    11: ["led", "#f2c94c"], 13: ["spk", "#4cc2c4"], 14: ["spk", "#4cc2c4"] };
+  const cell = (x, y, label, id, fill) => `
+    <g><rect x="${x}" y="${y}" width="96" height="40" rx="6" fill="${fill || "var(--bg)"}" fill-opacity="${fill ? .22 : 1}" stroke="${fill || "var(--line)"}" stroke-width="1.5"/>
+    <text x="${x + 10}" y="${y + 17}" font-size="10" fill="var(--muted)">${id}</text>
+    <text x="${x + 10}" y="${y + 32}" font-size="12" font-weight="500" fill="var(--ink)">${label}</text></g>`;
+  let svg = `<svg viewBox="0 0 340 300" role="img" aria-label="14-port board port map">
+    <rect x="1" y="1" width="338" height="298" rx="12" fill="var(--surface)" stroke="var(--line)"/>
+    <text x="16" y="24" font-size="11" fill="var(--muted)">left column</text>
+    <text x="232" y="24" font-size="11" fill="var(--muted)">right column</text>`;
+  for (let i = 0; i < 6; i++) {
+    const p = i + 1; svg += cell(12, 34 + i * 43, PM[p][0], "port " + p, PM[p][1]);
+    const q = [9, 10, 11, 12, 13, 14][i];
+    svg += q === 12 ? cell(232, 34 + i * 43, "reset", "port 12", null) : cell(232, 34 + i * 43, PM[q][0], "port " + q, PM[q][1]);
+  }
+  svg += cell(122, 34, PM[7][0], "port 7", PM[7][1]) + cell(122, 249, "USB-C", "port 8", null) + "</svg>";
+  document.getElementById("portmap").innerHTML = svg;
+})();
+</script>
+</body>
+</html>

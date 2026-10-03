@@ -1,0 +1,85 @@
+id: st7735_tft
+name: "ST7735 TFT Color Display (160x80)"
+category: display
+interface: gpio
+size: 2
+description: |
+  160x80 pixel colour TFT (ST7735 controller, SPI). Spans TWO adjacent ports.
+  65K colours (RGB565), text, shapes, and a flicker-free canvas buffer. Two
+  drawing modes: canvas mode (default — clear/draw/display, best for
+  dashboards) and direct mode (setDirectMode(true), best for games/animation).
+  Pin map: DC on Line A1, CS on Line B1, MOSI on Line A2, SCLK on Line B2.
+
+driver:
+  header: st7735_tft.h
+  source: st7735_tft.cpp
+  class_name: ST7735_TFT
+
+templates:
+  # Constructor is (sclk, cs, mosi, dc).
+  # SCLK = secondary Line B (pin_b2), CS = primary Line B (pin_b),
+  # MOSI = secondary Line A (pin_a2), DC = primary Line A (pin_a).
+  globals: |
+    ST7735_TFT {{ instance }}({{ pin_b2 }}, {{ pin_b }}, {{ pin_a2 }}, {{ pin_a }});
+  setup: |
+    {{ instance }}.begin();
+    {{ instance }}.clear();
+  loop: ""
+
+actions: []
+events: []
+lib_deps:
+  - "adafruit/Adafruit GFX Library"
+  - "adafruit/Adafruit ST7735 and ST7789 Library"
+
+usage: |
+  // Public API of ST7735_TFT — the instance is `{{ instance }}`. 160x80 px.
+  // begin() + clear() already ran in setup(). Colour constants live on the
+  // class: ST7735_TFT::COLOR_BLACK / _WHITE / _RED / _GREEN / _BLUE / _CYAN /
+  // _MAGENTA / _YELLOW / _ORANGE  (RGB565 uint16_t — raw values also accepted).
+
+  // --- CANVAS MODE (default): clear -> draw -> display. Flicker-free. ---
+  {{ instance }}.clear();
+  {{ instance }}.setCursor(4, 4);
+  {{ instance }}.setTextSize(1);
+  {{ instance }}.setTextColor(ST7735_TFT::COLOR_WHITE);
+  {{ instance }}.print("Hello");                 // print() takes ONE arg only
+  {{ instance }}.displayText("42C", 4, 30, 2, ST7735_TFT::COLOR_RED); // text+pos+size+colour
+  {{ instance }}.display();                       // push the frame to the screen
+
+  // --- ANIMATION: display() pushes all 160x80 px (25.6 kB) over SOFTWARE SPI
+  // and costs ~270 ms. Do NOT call it every frame -- you will watch the panel
+  // repaint. Instead paint the static backdrop once, then push only the box
+  // that changed (cost scales with area: a 44x52 box is ~16x cheaper, ~17 ms):
+  {{ instance }}.displayRegion(x, y, w, h);       // push ONLY this rectangle
+  // Repaint the box spanning the sprite's OLD and NEW positions so the old
+  // one is erased in the same push. ~30 fps is achievable this way.
+
+  // Software SPI clock (default 40 MHz). Lower it for screens on noisy pins
+  // -- on ESP32-S3, GPIO 33-37 share the octal flash/PSRAM bank:
+  {{ instance }}.setSPISpeed(10000000);
+
+  // --- shapes ---
+  {{ instance }}.fillScreen(ST7735_TFT::COLOR_BLACK);
+  {{ instance }}.drawRect(10, 10, 40, 20, ST7735_TFT::COLOR_GREEN);
+  {{ instance }}.fillRect(10, 10, 40, 20, ST7735_TFT::COLOR_BLUE);
+  {{ instance }}.drawCircle(80, 40, 15, ST7735_TFT::COLOR_YELLOW);
+  {{ instance }}.fillCircle(80, 40, 15, ST7735_TFT::COLOR_CYAN);
+  {{ instance }}.drawLine(0, 0, 159, 79, ST7735_TFT::COLOR_WHITE);
+  {{ instance }}.drawPixel(5, 5, ST7735_TFT::COLOR_RED);
+
+  // --- DIRECT MODE (games/animation): set once in setup, then never call ---
+  // clear()/fillScreen()/display() in the loop. Erase old position with a
+  // small fillRect(bg), then draw at the new position.
+  {{ instance }}.setDirectMode(true);
+
+  int16_t w = {{ instance }}.width();             // 160
+  int16_t h = {{ instance }}.height();            // 80
+  {{ instance }}.setRotation(1);                   // 0-3
+
+  // --- PORTRAIT panel: rotate drawing coords, framebuffer stays 160x80 ---
+  {{ instance }}.setCanvasRotation(1);             // now draw on 80 wide x 160 tall
+  {{ instance }}.displayRegion(x, y, w, h);        // portrait coords, mapped for you
+  // 1 vs 3 = which edge is "up". If the image is upside down, use the other.
+
+  // To position text: setCursor(x,y) THEN print(value) — never pass coords to print().
