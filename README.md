@@ -31,6 +31,24 @@ Case: `case/Clawd_Case_v2.stl`. Print it as one piece, as it comes, with no rota
 `case/PRINT_ME.md` and `case/CAD_NOTES.md`. The FreeCAD source is
 `case/ClaudeDeskCompanion.FCStd`.
 
+### Clawd body (new case)
+
+A newer body shell, printed and in use. Print each file as it comes, flat on the bed.
+All sizes are in millimetres.
+
+| File | Part | Size |
+|---|---|---|
+| `case/clawd_body.stl` | Body shell (open side up) | 160 × 120 × 70.5 |
+| `case/clawd_cover_knob.stl` | Trim plate around the knob | 44.6 × 44.6 × 2 |
+| `case/clawd_cover_button.stl` | Trim plate around the button | 24.6 × 24.6 × 2 |
+
+Reference print of the body: Bambu Lab H2S, textured PEI plate, PETG, 260.7 g,
+about 7 h 35 min.
+
+| Body | Inside | Knob cover | Button cover |
+|---|---|---|---|
+| ![Clawd body](case/img/clawd_body_print_orientation.png) | ![Inside the body](case/img/clawd_body_inside.png) | ![Knob cover](case/img/clawd_cover_knob.png) | ![Button cover](case/img/clawd_cover_button.png) |
+
 ## Get started
 
 ```bash
