@@ -34,7 +34,7 @@ Case: `case/Clawd_Case_v2.stl`. Print it as one piece, as it comes, with no rota
 ### Clawd body (new case)
 
 A newer body shell, printed and in use. Print each file as it comes, flat on the bed.
-All sizes are in millimetres.
+All sizes are in millimetres. Print settings and build steps: [`case/CLAWD_BODY.md`](case/CLAWD_BODY.md).
 
 | File | Part | Size |
 |---|---|---|
