@@ -1,0 +1,578 @@
+name: clawd_buddy_10port
+board: 10port
+modules_path: ../firmware/modules   # patched st7735_tft driver (setCanvasRotation for portrait eyes)
+
+# Clawd buddy on the 10-port board. No mic/speaker/LED grid (no room), so no voice.
+#
+#   FRONT  [1 IMU] [2+3 knob] [4 free] [5+6 left eye]
+#   BACK   [7+8 right eye] [9 button] [10 USB-C]
+#
+#   button press  cycles: beating heart -> "Hey Lamis" -> limited-edition message
+#                 (back to the normal eyes after 15 s without a press)
+#   knob turn     the eyes look left / right (back to wandering 4 s after)
+#   knob press    the pixel Clawd spinning in 3D; press again to stop (30 s max)
+#   shake         dizzy: eyes whirl in circles, spiral eyes, woozy sway, blink back
+#
+# Actions (atech send <key> <value>):
+#   mood     idle|thinking|tool|waiting|done|listening|speaking|error|sleep
+#   label    left-eye caption        detail   right-eye caption
+#   show     heart|hey|buddy|spin|dizzy|off   (test the overlays without touching it)
+#   orient_l / orient_r  1|3          live eye rotation test
+modules:
+  - {id: icm40608,       instance: imu,   port: 1}
+  - {id: rotary_encoder, instance: knob,  port: [2, 3]}
+  - {id: st7735_tft,     instance: eye_l, port: [5, 6]}
+  - {id: st7735_tft,     instance: eye_r, port: [7, 8]}
+  - {id: button,         instance: btn,   port: 9}
+
+code:
+  setup: |
+    // The screens are mounted PORTRAIT. Draw on an 80x160 canvas; 1 vs 3 is
+    // which panel edge is up. The boot card shows an arrow that must point UP
+    // on each eye - if one is upside down, flip its value here (or try it live
+    // with `atech send orient_l 3`).
+    const uint8_t EYE_L_ROT = 1, EYE_R_ROT = 1;
+    eye_l.setCanvasRotation(EYE_L_ROT);
+    eye_r.setCanvasRotation(EYE_R_ROT);
+    for (uint8_t e = 0; e < 2; e++) {
+      ST7735_TFT& s = e == 0 ? eye_l : eye_r;
+      s.fillScreen(ST7735_TFT::COLOR_BLACK);
+      for (int16_t i = 0; i < 22; i++) s.drawLine(40 - i, 24 + i, 40 + i, 24 + i, 0xDBAA);
+      s.fillRect(33, 46, 14, 44, 0xDBAA);
+      s.displayText("UP", 28, 100, 2, ST7735_TFT::COLOR_WHITE);
+      s.displayText(e == 0 ? "LEFT" : "RIGHT", e == 0 ? 17 : 11, 126, 2, ST7735_TFT::COLOR_WHITE);
+      s.display();
+    }
+    delay(2500);   // setup only: long enough to read the orientation card
+
+    knob.setRingColor(217, 119, 87);
+    knob.setRingBrightness(40);
+    imu.setShakeThreshold(1.6f);
+
+    Serial.println("{\"type\":\"event\",\"payload\":{\"event_type\":\"state\",\"key\":\"boot\",\"value\":\"clawd_buddy\"}}");
+
+  loop: |
+    // ======================= constants =======================
+    // PORTRAIT: logical canvas is 80 wide x 160 tall (see setCanvasRotation).
+    const int16_t  W = 80;
+    const int16_t  CX = 40, CY = 68;          // eye centre; y 0..135 is eye area
+    const int16_t  EYE_MAX_Y = 136;           // caption strip lives below this
+    const int16_t  CAP_Y = 137, CAP_H = 23;   // two 13-char lines
+    const uint16_t C_BLACK  = 0x0000;
+    const uint16_t C_WHITE  = 0xFFFF;
+    const uint16_t C_ORANGE = 0xDBAA;         // #D97757 Claude orange
+    const uint16_t C_AMBER  = 0xFD80;         // #FFB000
+    const uint16_t C_BLUE   = 0x5E5F;         // #5AC8FA
+    const uint16_t C_RED    = 0xE249;         // #E5484D
+    const uint16_t C_HEART  = 0xF128;         // #F02443
+    const uint16_t C_DIM    = 0x69C5;         // #6B3A2B
+    const uint16_t C_GREY   = 0x8410;
+    const uint32_t SLEEP_AFTER_MS = 10UL * 60UL * 1000UL;
+
+    enum Mood { IDLE, THINKING, TOOL, WAITING, DONE, LISTENING, SPEAKING, ERR, SLEEP };
+    enum Style { PILL, HAPPY, FLAT };
+    struct Shape { int16_t dx, dy, w, h; uint16_t col; uint16_t style; };   // no padding: memcmp-safe
+
+    // Overlays take over both eyes; the mood keeps updating underneath.
+    enum Ov { OV_NONE, OV_HEART, OV_HEY, OV_BUDDY, OV_SPIN, OV_DIZZY };
+    const uint32_t MSG_MS = 15000, SPIN_MS = 30000, DIZZY_MS = 3800;
+    const int16_t  SPIN_Y = 44, SPIN_H = 48;   // 8 rows of 6 px
+
+    // The Clawd sprite, 12 x 8 cells. E = eye (black on the front face).
+    static const char* const CLAWD[8] = {
+      "..########..",
+      "..#E####E#..",
+      "############",
+      "############",
+      "..########..",
+      "..########..",
+      "..#.#..#.#..",
+      "..#.#..#.#..",
+    };
+    static const char* const HEART[6] = {
+      ".##.##.",
+      "#######",
+      "#######",
+      ".#####.",
+      "..###..",
+      "...#...",
+    };
+
+    // ======================= state =======================
+    static bool     booted = false;
+    static Mood     mood = IDLE;
+    static uint32_t moodSince = 0, lastActivity = 0, lastFrame = 0;
+    static bool     needFull = true, capDirty = true;
+    static Shape    cur = {0, 0, 0, 0, 0, PILL};
+    static char     label[27] = "", detail[27] = "";
+    static float    t = 0.0f;
+    static int16_t  gazeX = 0, gazeY = 0, tgtX = 0, tgtY = 0;
+    static uint32_t nextGlance = 0, nextBlink = 0, blinkUntil = 0;
+    static uint8_t  ov = OV_NONE;
+    static uint32_t ovSince = 0, ovFrame = 0;
+    static bool     ovDirty = false;
+    static int8_t   heartBig = -1;
+    static int16_t  spinX0 = 0, spinX1 = 80;
+    static int16_t  dzX[2] = {0, 0}, dzY[2] = {0, 0}, dzW[2] = {0, 0}, dzH[2] = {0, 0};
+    static int32_t  lastKnob = 0;
+    static int16_t  lookX = 0;
+    static uint32_t knobAt = 0;
+
+    uint32_t now = millis();
+    if (!booted) {
+      booted = true;
+      moodSince = lastActivity = now;
+      nextGlance = now + 2000;
+      nextBlink = now + 3000;
+      lastKnob = knob.getPosition();
+    }
+
+    // ======================= helpers =======================
+    auto rgb = [](float r, float g, float b) -> uint16_t {
+      return (((uint16_t)r & 0xF8) << 8) | (((uint16_t)g & 0xFC) << 3) | ((uint16_t)b >> 3);
+    };
+
+    auto rrect = [](ST7735_TFT& s, int16_t x, int16_t y, int16_t w, int16_t h, int16_t r, uint16_t c) {
+      if (w <= 0 || h <= 0) return;
+      if (r * 2 > w) r = w / 2;
+      if (r * 2 > h) r = h / 2;
+      s.fillRect(x + r, y, w - 2 * r, h, c);
+      s.fillRect(x, y + r, w, h - 2 * r, c);
+      if (r > 0) {
+        s.fillCircle(x + r,         y + r,         r, c);
+        s.fillCircle(x + w - r - 1, y + r,         r, c);
+        s.fillCircle(x + r,         y + h - r - 1, r, c);
+        s.fillCircle(x + w - r - 1, y + h - r - 1, r, c);
+      }
+    };
+
+    // Bounding box of a shape, clipped to the eye area.
+    auto bbox = [&](const Shape& s, int16_t& x, int16_t& y, int16_t& w, int16_t& h) {
+      int16_t cx = CX + s.dx, cy = CY + s.dy;
+      if (s.style == HAPPY) { x = cx - s.w / 2 - 1; y = cy - s.w / 2 - 1; w = s.w + 2; h = s.w / 2 + 8; }
+      else if (s.style == FLAT) { x = cx - s.w / 2; y = cy - 3; w = s.w; h = 6; }
+      else { x = cx - s.w / 2; y = cy - s.h / 2; w = s.w; h = s.h; }
+      if (x < 0) { w += x; x = 0; }
+      if (y < 0) { h += y; y = 0; }
+      if (x + w > W) w = W - x;
+      if (y + h > EYE_MAX_Y) h = EYE_MAX_Y - y;
+    };
+
+    auto drawShape = [&](ST7735_TFT& s, const Shape& e) {
+      int16_t cx = CX + e.dx, cy = CY + e.dy;
+      if (e.style == HAPPY) {
+        // Upward crescent "^": a disc with a black disc bitten out underneath.
+        int16_t r = e.w / 2;
+        s.fillCircle(cx, cy, r, e.col);
+        s.fillCircle(cx, cy + 14, r, C_BLACK);
+        s.fillRect(cx - r - 1, cy + 6, e.w + 3, r, C_BLACK);
+      } else if (e.style == FLAT) {
+        rrect(s, cx - e.w / 2, cy - 2, e.w, 4, 2, e.col);
+      } else {
+        rrect(s, cx - e.w / 2, cy - e.h / 2, e.w, e.h, 16, e.col);
+      }
+      // Never let the eye bleed into the caption strip.
+      s.fillRect(0, EYE_MAX_Y, W, CAP_Y - EYE_MAX_Y, C_BLACK);
+    };
+
+    auto drawCaption = [&](ST7735_TFT& s, const char* text, uint16_t col) {
+      // Up to 26 chars, wrapped into two centred lines of 13.
+      s.fillRect(0, CAP_Y, W, CAP_H, C_BLACK);
+      int16_t len = strlen(text);
+      char part[14];
+      for (int16_t ln = 0; ln < 2 && ln * 13 < len; ln++) {
+        int16_t n = len - ln * 13;
+        if (n > 13) n = 13;
+        memcpy(part, text + ln * 13, n);
+        part[n] = 0;
+        s.displayText(part, (W - n * 6) / 2, CAP_Y + 2 + ln * 11, 1, col);
+      }
+    };
+
+    // Push a new eye shape: repaint only the union of old and new boxes.
+    auto render = [&](const Shape& n) {
+      if (!needFull && memcmp(&n, &cur, sizeof(Shape)) == 0) return;
+      for (uint8_t i = 0; i < 2; i++) {
+        ST7735_TFT& s = i == 0 ? eye_l : eye_r;
+        if (needFull) {
+          s.fillScreen(C_BLACK);
+          drawShape(s, n);
+          drawCaption(s, i == 0 ? label : detail, i == 0 ? C_ORANGE : C_GREY);
+          s.display();
+        } else {
+          int16_t ox, oy, ow, oh, nx, ny, nw, nh;
+          bbox(cur, ox, oy, ow, oh);
+          bbox(n, nx, ny, nw, nh);
+          int16_t x0 = min(ox, nx), y0 = min(oy, ny);
+          int16_t x1 = max(ox + ow, nx + nw), y1 = max(oy + oh, ny + nh);
+          if (x0 > 0) x0--;
+          if (y0 > 0) y0--;
+          if (x1 < W) x1++;
+          if (y1 > EYE_MAX_Y) y1 = EYE_MAX_Y;
+          if (x1 <= x0 || y1 <= y0) continue;
+          s.fillRect(x0, y0, x1 - x0, y1 - y0, C_BLACK);
+          drawShape(s, n);
+          s.displayRegion(x0, y0, x1 - x0, y1 - y0);
+        }
+      }
+      if (needFull) capDirty = false;
+      needFull = false;
+      cur = n;
+    };
+
+    auto pushCaptions = [&]() {
+      drawCaption(eye_l, label, C_ORANGE);
+      eye_l.displayRegion(0, CAP_Y, W, CAP_H);
+      drawCaption(eye_r, detail, C_GREY);
+      eye_r.displayRegion(0, CAP_Y, W, CAP_H);
+      capDirty = false;
+    };
+
+    auto setMood = [&](Mood m) {
+      lastActivity = now;
+      if (m == mood) return;
+      mood = m;
+      moodSince = now;
+      t = 0.0f;
+      needFull = true;
+      blinkUntil = 0;
+    };
+
+    auto copyText = [](char* dst, const char* src) {
+      int i = 0;
+      for (; src[i] && i < 26; i++) dst[i] = (src[i] >= 32 && src[i] < 127) ? src[i] : '?';
+      dst[i] = 0;
+    };
+
+    auto moodFrom = [](const char* v, Mood fallback) -> Mood {
+      if (!strcmp(v, "idle"))      return IDLE;
+      if (!strcmp(v, "thinking"))  return THINKING;
+      if (!strcmp(v, "tool"))      return TOOL;
+      if (!strcmp(v, "waiting"))   return WAITING;
+      if (!strcmp(v, "done"))      return DONE;
+      if (!strcmp(v, "listening")) return LISTENING;
+      if (!strcmp(v, "speaking"))  return SPEAKING;
+      if (!strcmp(v, "error"))     return ERR;
+      if (!strcmp(v, "sleep"))     return SLEEP;
+      return fallback;
+    };
+
+    // ----- overlays -----
+    auto startOv = [&](uint8_t o) {
+      ov = o;
+      ovSince = now;
+      ovDirty = true;
+      heartBig = -1;
+      lastActivity = now;
+      if (mood == SLEEP) { mood = IDLE; moodSince = now; }
+    };
+    auto endOv = [&]() {
+      ov = OV_NONE;
+      needFull = true;
+      capDirty = true;
+      blinkUntil = 0;
+      nextBlink = now + 150;   // come back with a blink
+      knob.setRingPosition(-1.0f);   // ring follows the knob again
+      lastActivity = now;
+    };
+
+    // One line of text, centred; letters squeezed together if it would not fit.
+    auto say = [&](ST7735_TFT& s, const char* txt, int16_t y, uint8_t size, uint16_t col) {
+      int16_t n = strlen(txt);
+      int16_t adv = 6 * size;
+      if (n > 1 && (n - 1) * adv + 5 * size > W) adv = (W - 5 * size) / (n - 1);
+      int16_t x = (W - ((n - 1) * adv + 5 * size)) / 2;
+      char ch[2] = {0, 0};
+      for (int16_t i = 0; i < n; i++) {
+        ch[0] = txt[i];
+        s.displayText(ch, x + i * adv, y, size, col);
+      }
+    };
+
+    auto drawHeart = [&](ST7735_TFT& s, int16_t cx, int16_t cy, int16_t c, uint16_t col) {
+      int16_t x0 = cx - 7 * c / 2, y0 = cy - 3 * c;
+      for (int16_t r = 0; r < 6; r++)
+        for (int16_t k = 0; k < 7; k++)
+          if (HEART[r][k] == '#') s.fillRect(x0 + k * c, y0 + r * c, c, c, col);
+      if (c >= 4) s.fillRect(x0 + c, y0 + c, c / 2, c / 2, C_WHITE);   // shine
+    };
+
+    // The sprite extruded into a block figure, turned by `a` about the vertical
+    // axis, orthographic. Every face projects to an axis-aligned rect, so
+    // fillRect is enough. Front/back faces are never occluded; side faces are
+    // drawn first, far to near. Returns the x-span it touched.
+    auto drawClawd3D = [&](ST7735_TFT& s, float a, int16_t y0, int16_t& xmin, int16_t& xmax) {
+      const int16_t CS = 6;
+      const float   C = 6.0f, HD = 9.0f;      // cell size, half depth
+      float co = cosf(a), si = sinf(a);
+      xmin = W; xmax = 0;
+      auto cell = [&](int c, int r) -> char { return (c < 0 || c > 11) ? '.' : CLAWD[r][c]; };
+      auto span = [&](float xa, float xb, int16_t y, uint16_t col) {
+        if (xa > xb) { float tmp = xa; xa = xb; xb = tmp; }
+        int16_t ia = (int16_t)lroundf(CX + xa), ib = (int16_t)lroundf(CX + xb);
+        if (ib <= ia) return;
+        s.fillRect(ia, y, ib - ia, CS, col);
+        if (ia < xmin) xmin = ia;
+        if (ib > xmax) xmax = ib;
+      };
+      uint16_t sideCol = rgb(217 * (0.30f + 0.35f * fabsf(si)), 119 * (0.30f + 0.35f * fabsf(si)), 87 * (0.30f + 0.35f * fabsf(si)));
+      float kf = 0.50f + 0.50f * fabsf(co);
+      uint16_t faceCol = rgb(217 * kf, 119 * kf, 87 * kf);
+      for (int r = 0; r < 8; r++) {
+        int16_t y = y0 + r * CS;
+        if (si < 0) {          // right-hand faces visible; larger x is nearer
+          for (int c = 0; c < 12; c++)
+            if (cell(c, r) != '.' && cell(c + 1, r) == '.') { float x = (c - 5) * C; span(x * co - HD * si, x * co + HD * si, y, sideCol); }
+        } else if (si > 0) {   // left-hand faces visible; smaller x is nearer
+          for (int c = 11; c >= 0; c--)
+            if (cell(c, r) != '.' && cell(c - 1, r) == '.') { float x = (c - 6) * C; span(x * co - HD * si, x * co + HD * si, y, sideCol); }
+        }
+      }
+      float z = co >= 0 ? HD : -HD;   // whichever of front/back faces the viewer
+      for (int r = 0; r < 8; r++) {
+        int16_t y = y0 + r * CS;
+        for (int c = 0; c < 12; c++) {
+          char k = cell(c, r);
+          if (k == '.') continue;
+          float xl = (c - 6) * C, xr = xl + C;
+          span(xl * co + z * si, xr * co + z * si, y, (k == 'E' && co > 0) ? C_BLACK : faceCol);
+        }
+      }
+    };
+
+    auto drawSpiral = [&](ST7735_TFT& s, float rot) {
+      for (int i = 0; i < 56; i++) {
+        float th = i * 0.22f, r = 2.0f + i * 0.42f;   // stays inside a 56 px box
+        s.fillCircle(CX + (int16_t)(r * cosf(th + rot)), CY + (int16_t)(r * sinf(th + rot)), 2, C_ORANGE);
+      }
+    };
+
+    // Full-screen paint of an overlay's static parts.
+    auto paintOv = [&]() {
+      for (uint8_t e = 0; e < 2; e++) {
+        ST7735_TFT& s = e == 0 ? eye_l : eye_r;
+        s.fillScreen(C_BLACK);
+        switch (ov) {
+          case OV_HEART:
+            drawHeart(s, CX, 72, 10, C_HEART);
+            break;
+          case OV_HEY:
+            if (e == 0) say(s, "Hey", 58, 3, C_ORANGE);
+            else        say(s, "Lamis", 58, 3, C_WHITE);
+            drawHeart(s, CX, 112, 3, C_HEART);
+            break;
+          case OV_BUDDY:
+            if (e == 0) {
+              say(s, "I am",    30, 2, C_WHITE);
+              say(s, "your",    52, 2, C_WHITE);
+              say(s, "limited", 80, 2, C_ORANGE);
+              say(s, "edition", 102, 2, C_ORANGE);
+            } else {
+              say(s, "Atech-",  40, 2, C_WHITE);
+              say(s, "Claw'd",  62, 2, C_ORANGE);
+              say(s, "buddy",   84, 2, C_WHITE);
+              drawHeart(s, CX, 124, 3, C_HEART);
+            }
+            break;
+          case OV_SPIN:
+            say(s, e == 0 ? "Atech" : "Claw'd", 116, 2, e == 0 ? C_WHITE : C_ORANGE);
+            break;
+          default:
+            break;
+        }
+        s.display();
+      }
+      spinX0 = 0; spinX1 = W;
+      dzW[0] = dzW[1] = 0;
+      ovFrame = 0;
+    };
+
+    auto animateOv = [&]() {
+      if (ov == OV_HEART) {
+        // Lub-dub: one thump every 1.2 s. Repaint only when the size changes.
+        int8_t big = ((now - ovSince) % 1200) < 180 ? 1 : 0;
+        if (big == heartBig) return;
+        heartBig = big;
+        for (uint8_t e = 0; e < 2; e++) {
+          ST7735_TFT& s = e == 0 ? eye_l : eye_r;
+          s.fillRect(0, 36, W, 70, C_BLACK);
+          drawHeart(s, CX, 72, big ? 11 : 10, C_HEART);
+          s.displayRegion(0, 36, W, 70);
+        }
+      } else if (ov == OV_SPIN) {
+        if (now - ovFrame < 30) return;
+        ovFrame = now;
+        float a = (now - ovSince) * 0.0020944f;   // one turn per 3 s
+        int16_t x0 = W, x1 = 0;
+        for (uint8_t e = 0; e < 2; e++) {
+          ST7735_TFT& s = e == 0 ? eye_l : eye_r;
+          s.fillRect(0, SPIN_Y, W, SPIN_H, C_BLACK);
+          drawClawd3D(s, a, SPIN_Y, x0, x1);
+        }
+        int16_t ua = min(x0, spinX0), ub = max(x1, spinX1);
+        if (ub > ua) {
+          eye_l.displayRegion(ua, SPIN_Y, ub - ua, SPIN_H);
+          eye_r.displayRegion(ua, SPIN_Y, ub - ua, SPIN_H);
+        }
+        spinX0 = x0; spinX1 = x1;
+      } else if (ov == OV_DIZZY) {
+        // whirl (eyes race in circles) -> spiral eyes -> woozy sway, ring spinning.
+        if (now - ovFrame < 25) return;
+        ovFrame = now;
+        uint32_t el = now - ovSince;
+        if (el < 2800) knob.setRingPosition(fmodf(el * 0.03f, 12.0f));
+        else           knob.setRingPosition(6.0f + 3.0f * sinf(el * 0.008f));
+        for (uint8_t e = 0; e < 2; e++) {
+          ST7735_TFT& s = e == 0 ? eye_l : eye_r;
+          float dir = e == 0 ? 1.0f : -1.0f;     // the two eyes go opposite ways
+          int16_t x, y, w, h;
+          if (el < 1300) {
+            float a = el * 0.016f * dir;         // ~2.5 turns per second
+            w = 26; h = 36;
+            x = CX + (int16_t)(16 * cosf(a)) - w / 2;
+            y = CY + (int16_t)(16 * sinf(a)) - h / 2;
+          } else if (el < 2800) {
+            x = CX - 28; y = CY - 28; w = 56; h = 56;
+          } else {
+            w = 40; h = 14;
+            x = CX + (int16_t)(10 * sinf(el * 0.008f)) - w / 2;
+            y = CY + 14 - h / 2;
+          }
+          s.fillRect(dzX[e], dzY[e], dzW[e], dzH[e], C_BLACK);
+          s.fillRect(x, y, w, h, C_BLACK);
+          if (el < 1300)      rrect(s, x, y, w, h, 12, C_ORANGE);
+          else if (el < 2800) drawSpiral(s, (el - 1300) * 0.02f * dir);
+          else                rrect(s, x, y, w, h, 7, C_ORANGE);
+          int16_t ux = x, uy = y, ux2 = x + w, uy2 = y + h;
+          if (dzW[e] > 0) {
+            ux = min(ux, dzX[e]); uy = min(uy, dzY[e]);
+            ux2 = max(ux2, (int16_t)(dzX[e] + dzW[e])); uy2 = max(uy2, (int16_t)(dzY[e] + dzH[e]));
+          }
+          s.displayRegion(ux, uy, ux2 - ux, uy2 - uy);
+          dzX[e] = x; dzY[e] = y; dzW[e] = w; dzH[e] = h;
+        }
+      }
+    };
+
+    // ======================= 1. actions from the laptop =======================
+    if (atech_action.length()) {
+      const char* v = atech_value.c_str();
+      if (atech_action == "mood")        { setMood(moodFrom(v, mood)); atechDone(); }
+      else if (atech_action == "label")  { copyText(label, v);  capDirty = true; lastActivity = now; atechDone(); }
+      else if (atech_action == "detail") { copyText(detail, v); capDirty = true; lastActivity = now; atechDone(); }
+      else if (atech_action == "orient_l") { eye_l.setCanvasRotation(atoi(v)); needFull = true; ovDirty = ov != OV_NONE; atechDone(); }
+      else if (atech_action == "orient_r") { eye_r.setCanvasRotation(atoi(v)); needFull = true; ovDirty = ov != OV_NONE; atechDone(); }
+      else if (atech_action == "show") {
+        if      (!strcmp(v, "heart")) startOv(OV_HEART);
+        else if (!strcmp(v, "hey"))   startOv(OV_HEY);
+        else if (!strcmp(v, "buddy")) startOv(OV_BUDDY);
+        else if (!strcmp(v, "spin"))  startOv(OV_SPIN);
+        else if (!strcmp(v, "dizzy")) startOv(OV_DIZZY);
+        else if (ov != OV_NONE)       endOv();
+        atechDone();
+      }
+    }
+
+    // ======================= 2. button, knob, shake =======================
+    if (btn.wasPressed()) {
+      startOv(ov == OV_HEART ? OV_HEY : ov == OV_HEY ? OV_BUDDY : OV_HEART);
+    }
+    if (knob.wasPressed()) {
+      if (ov == OV_SPIN) endOv();
+      else startOv(OV_SPIN);
+    }
+    // Turning the knob steers the gaze: clockwise looks right.
+    int32_t kpos = knob.getPosition();
+    if (kpos != lastKnob) {
+      int32_t d = kpos - lastKnob;
+      lastKnob = kpos;
+      lookX = constrain(lookX + d * 3, -16, 16);
+      tgtX = lookX;
+      tgtY = 0;
+      knobAt = now;
+      nextGlance = now + 4000;   // hold the look, then wander again
+      lastActivity = now;
+      if (mood == SLEEP) setMood(IDLE);
+    }
+
+    if (imu.wasShaken() && ov != OV_DIZZY) startOv(OV_DIZZY);
+
+    if (ov == OV_HEART || ov == OV_HEY || ov == OV_BUDDY) { if (now - ovSince > MSG_MS) endOv(); }
+    else if (ov == OV_SPIN  && now - ovSince > SPIN_MS)  endOv();
+    else if (ov == OV_DIZZY && now - ovSince > DIZZY_MS) endOv();
+
+    // ======================= 3. mood timeouts =======================
+    uint32_t inMood = now - moodSince;
+    if (mood == DONE && inMood > 10000)           setMood(IDLE);
+    if (mood == ERR && inMood > 6000)             setMood(IDLE);
+    if (mood == WAITING && inMood > 300000UL)     setMood(IDLE);
+    if (mood == SPEAKING && inMood > 8000)        setMood(IDLE);
+    if (mood == IDLE && now - lastActivity > SLEEP_AFTER_MS) { mood = SLEEP; moodSince = now; needFull = true; }
+
+    // ======================= 4. eyes =======================
+    if (ov != OV_NONE) {
+      if (ovDirty) { ovDirty = false; paintOv(); }
+      animateOv();
+    } else if (needFull || now - lastFrame >= 40) {
+      const uint32_t frameMs = 40;
+      lastFrame = now;
+      t += frameMs / 1000.0f;
+      Shape s = {0, 0, 46, 84, C_ORANGE, PILL};
+
+      // Shared idle-style gaze: hop to a new point, ease toward it.
+      if (now >= nextGlance) {
+        const int8_t gx[] = {-12, -6, 0, 0, 6, 12};
+        const int8_t gy[] = {-16, 0, 0, 10};
+        tgtX = gx[random(6)];
+        tgtY = gy[random(4)];
+        nextGlance = now + 1800 + random(3200);
+      }
+      gazeX += (tgtX - gazeX) / 3 + (tgtX > gazeX) - (tgtX < gazeX);
+      gazeY += (tgtY - gazeY) / 3 + (tgtY > gazeY) - (tgtY < gazeY);
+
+      switch (mood) {
+        case IDLE:
+          s.dx = gazeX; s.dy = gazeY;
+          break;
+        case THINKING:   // eyes up and drifting in a slow circle
+          s = {(int16_t)(10 * cosf(t * 1.6f)), (int16_t)(-20 + 8 * sinf(t * 1.6f)), 40, 62, C_ORANGE, PILL};
+          break;
+        case TOOL:       // narrowed, looking down, scanning like reading
+          s = {(int16_t)(12 * sinf(t * 3.0f)), 18, 52, 34, C_ORANGE, PILL};
+          break;
+        case WAITING:    // wide, amber, bouncing - "your turn"
+          s = {0, (int16_t)(-3 + 6 * fabsf(sinf(t * 5.0f))), 60, 108, C_AMBER, PILL};
+          break;
+        case DONE:
+          s = {0, (int16_t)(4 + 3 * sinf(t * 3.0f)), 58, 0, C_ORANGE, HAPPY};
+          break;
+        case LISTENING:
+          s = {0, 0, 52, 80, C_BLUE, PILL};
+          break;
+        case SPEAKING:
+          s = {0, (int16_t)(3 * sinf(t * 6.0f)), 46, 80, C_ORANGE, PILL};
+          break;
+        case ERR:
+          s = {0, 8, 56, 18, C_RED, PILL};
+          break;
+        case SLEEP:
+          s = {0, 20, 50, 0, C_DIM, FLAT};
+          break;
+      }
+
+      // Blink (moods with open pill eyes only).
+      if (mood == IDLE || mood == THINKING || mood == WAITING || mood == SPEAKING) {
+        if (blinkUntil == 0 && now >= nextBlink) {
+          blinkUntil = now + 120;
+          nextBlink = now + (mood == WAITING ? 1500 : 2500 + random(3500));
+        }
+        if (blinkUntil) {
+          if (now < blinkUntil) s.style = FLAT;
+          else blinkUntil = 0;
+        }
+      }
+      // A recent knob turn steers any open-eyed mood, not just idle.
+      if (now - knobAt < 4000 && s.style == PILL) s.dx = gazeX;
+      render(s);
+      if (capDirty) pushCaptions();
+    }

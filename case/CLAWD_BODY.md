@@ -48,5 +48,10 @@ Our reference print:
 
 ## Firmware
 
-The Atech project for the Claw'd buddy is in [`firmware/`](../firmware/). See the
-main [README](../README.md) for how to build and flash it.
+There are two Atech projects for the Claw'd buddy:
+
+- [`firmware-10port/`](../firmware-10port/): the 10-port build with an IMU, a knob,
+  two eye screens and a button, which matches the knob and button covers.
+- [`firmware/`](../firmware/): the 14-port build with voice.
+
+See the main [README](../README.md) for how to build and flash them.

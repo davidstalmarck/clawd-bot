@@ -118,6 +118,33 @@ the SDK's own copies:
   continuous capture (the stock driver records at most 3 s).
 - `st7735_tft`: adds `setCanvasRotation()` for portrait-mounted panels.
 
+### 10-port buddy (`firmware-10port/`)
+
+A smaller build on the Atech 10-port board, with no voice. It runs on a real board.
+
+| Module | Instance | Ports |
+|---|---|---|
+| IMU | `imu` | 1 |
+| Rotary encoder | `knob` | 2+3 |
+| ST7735 screen ×2 | `eye_l`, `eye_r` | 5+6, 7+8 |
+| Button | `btn` | 9 |
+
+- **Button:** cycles a beating pixel heart, "Hey / Lamis", and "I am your limited
+  edition Atech-Claw'd buddy". It returns to the eyes after 15 s.
+- **Turn the knob:** the eyes look left and right.
+- **Press the knob:** the pixel Clawd spins in 3D. Press again to stop.
+- **Shake:** the eyes whirl, go to spirals, sway, then blink back.
+- **Startup:** each eye shows an UP arrow and LEFT / RIGHT, so you can check how
+  the screens are mounted.
+- It still takes the bridge's `mood`, `label` and `detail` actions, plus
+  `show heart|hey|buddy|spin|dizzy|off` for testing (`atech send show heart`).
+
+```bash
+atech upload firmware-10port
+```
+
+It reuses the patched `st7735_tft` driver from `firmware/modules/`.
+
 ## Status
 
 | | |
