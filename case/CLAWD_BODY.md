@@ -1,5 +1,7 @@
 # Clawd body — print and build
 
+The Clawd desktop 3D print. Designed by Gustav Hugod & Claude.
+
 Three parts. All files are in millimetres and already oriented for printing:
 load them into your slicer as they come, with no rotation.
 
