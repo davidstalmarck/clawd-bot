@@ -14,6 +14,23 @@ and that you can talk to.
 Open `docs/index.html` for a live preview of every mood. That page is also the project
 website (see below).
 
+## 3D prints
+
+The Clawd desktop 3D print, designed by Gustav Hugod & Claude. Click a file name to
+turn the model around in GitHub's 3D viewer.
+
+<p align="center">
+  <img src="case/img/clawd_body_print_orientation.png" alt="Clawd body" width="640">
+</p>
+
+| [Body, inside](case/clawd_body.stl) | [Body, underside](case/clawd_body.stl) |
+|---|---|
+| <img src="case/img/clawd_body_inside.png" alt="Inside the body" width="400"> | <img src="case/img/clawd_body_underside.png" alt="Underside of the body" width="400"> |
+| [**Knob cover**](case/clawd_cover_knob.stl) | [**Button cover**](case/clawd_cover_button.stl) |
+| <img src="case/img/clawd_cover_knob.png" alt="Knob cover" width="400"> | <img src="case/img/clawd_cover_button.png" alt="Button cover" width="400"> |
+
+Print settings and build steps: [`case/CLAWD_BODY.md`](case/CLAWD_BODY.md).
+
 ## Hardware
 
 Built on an [Atech](https://atech.dev) 14-port board (ESP32-S3), using all 12 slots:
@@ -44,11 +61,7 @@ All sizes are in millimetres. Print settings and build steps: [`case/CLAWD_BODY.
 | `case/clawd_cover_button.stl` | Trim plate around the button | 24.6 × 24.6 × 2 |
 
 Reference print of the body: Bambu Lab H2S, textured PEI plate, PETG, 260.7 g,
-about 7 h 35 min.
-
-| Body | Inside | Knob cover | Button cover |
-|---|---|---|---|
-| ![Clawd body](case/img/clawd_body_print_orientation.png) | ![Inside the body](case/img/clawd_body_inside.png) | ![Knob cover](case/img/clawd_cover_knob.png) | ![Button cover](case/img/clawd_cover_button.png) |
+about 7 h 35 min. Pictures: [3D prints](#3d-prints) above.
 
 ## Get started
 
